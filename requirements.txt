@@ -1,0 +1,12 @@
+# Document Parser
+python-docx>=1.1.0
+
+# GUI (tkinter is included with Python, but listed for reference)
+# No additional GUI packages needed
+
+# Utilities
+python-dotenv>=1.0.0
+
+# Build Tools (for creating executable)
+pyinstaller>=5.13.0
+
