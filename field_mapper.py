@@ -1,0 +1,1681 @@
+"""
+Field Mapper - Desktop Tool
+Compares database table fields with JSON file fields
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+import json
+import os
+import sys
+import glob
+import logging
+import threading
+from typing import Dict, List, Set, Tuple
+from datetime import datetime
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Handle bundled executable (PyInstaller)
+def resource_path(relative_path):
+    """Get absolute path to resource, works for dev and for PyInstaller"""
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+from document_parser import DocumentParser
+from field_loader import FieldLoader
+from json_parser import JSONParser
+from field_comparator import FieldComparator
+
+
+class FieldMapperApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Field Mapper - Document to JSON Comparison Tool")
+        self.root.geometry("1200x800")
+        
+        # Initialize components
+        self.document_parser = DocumentParser()
+        self.field_loader = FieldLoader()
+        self.json_parser = JSONParser()
+        self.comparator = FieldComparator()
+        
+        # Data storage
+        self.db_fields = {}  # Format: {'database_name.table_name': [fields]}
+        self.all_db_fields = []  # All fields from all databases/tables combined
+        self.json_fields = {}  # Loaded JSON files
+        self.json_folder = None  # Folder path for batch processing
+        self.json_files_list = []  # List of JSON files in folder
+        self.comparison_results = {}
+        self.parsed_document_data = {}
+        self.loader_data = {}
+        self.record_unmatched_info = {}  # Store per-record unmatched field info: {file_path: {record_idx: {unmatched_json: [], unmatched_db: []}}}
+        self.fields_with_special_chars = {'db': [], 'json': []}  # Store fields with special characters
+        
+        self.create_widgets()
+        self.auto_load_config()
+        
+    def create_widgets(self):
+        # Main container
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Configure grid weights
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(1, weight=1)
+        main_frame.rowconfigure(2, weight=1)
+        
+        # Title
+        title_label = ttk.Label(main_frame, text="Field Mapper Tool", 
+                                font=("Arial", 16, "bold"))
+        title_label.grid(row=0, column=0, columnspan=3, pady=(0, 20))
+        
+        # Annexure Selection Section
+        db_selection_frame = ttk.LabelFrame(main_frame, text="Annexure Fields Selection", padding="10")
+        db_selection_frame.grid(row=1, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
+        db_selection_frame.columnconfigure(1, weight=1)
+        
+        ttk.Label(db_selection_frame, text="Select Annexure:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+        self.database_var = tk.StringVar()
+        self.database_combo = ttk.Combobox(db_selection_frame, textvariable=self.database_var, 
+                                           state="readonly", width=40)
+        self.database_combo.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
+        self.database_combo.bind('<<ComboboxSelected>>', self.on_database_selected)
+        
+        ttk.Button(db_selection_frame, text="Load Annexure Fields", 
+                 command=self.load_database_fields).grid(row=0, column=2, padx=5, pady=5)
+        
+        ttk.Label(db_selection_frame, text="Status:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+        self.db_status_var = tk.StringVar(value="Please select an annexure and click 'Load Annexure Fields'")
+        status_label = ttk.Label(db_selection_frame, textvariable=self.db_status_var, 
+                                 foreground="blue")
+        status_label.grid(row=1, column=1, sticky=tk.W, padx=5, pady=5)
+        
+        ttk.Label(db_selection_frame, text="Total Fields:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
+        self.total_fields_var = tk.StringVar(value="0")
+        ttk.Label(db_selection_frame, textvariable=self.total_fields_var, 
+                 font=("Arial", 10, "bold")).grid(row=2, column=1, sticky=tk.W, padx=5, pady=5)
+        
+        # JSON Section
+        json_frame = ttk.LabelFrame(main_frame, text="JSON Folder Configuration", padding="10")
+        json_frame.grid(row=1, column=3, columnspan=2, sticky=(tk.W, tk.E), pady=5, padx=(10, 0))
+        json_frame.columnconfigure(1, weight=1)
+        
+        ttk.Label(json_frame, text="JSON Folder:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+        self.json_folder_var = tk.StringVar()
+        json_folder_entry = ttk.Entry(json_frame, textvariable=self.json_folder_var, width=40, state="readonly")
+        json_folder_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
+        
+        ttk.Button(json_frame, text="Browse Folder", 
+                  command=self.browse_json_folder).grid(row=0, column=2, padx=5, pady=5)
+        
+        ttk.Label(json_frame, text="JSON Path (optional):").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+        self.json_path_var = tk.StringVar()
+        json_path_entry = ttk.Entry(json_frame, textvariable=self.json_path_var, width=40)
+        json_path_entry.grid(row=1, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
+        
+        # Results Section
+        results_frame = ttk.LabelFrame(main_frame, text="Comparison Results", padding="10")
+        results_frame.grid(row=2, column=0, columnspan=5, sticky=(tk.W, tk.E, tk.N, tk.S), pady=10)
+        results_frame.columnconfigure(0, weight=1)
+        results_frame.rowconfigure(0, weight=1)
+        
+        # Notebook for tabs
+        self.notebook = ttk.Notebook(results_frame)
+        self.notebook.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Comparison Results Tab
+        comparison_frame = ttk.Frame(self.notebook)
+        self.notebook.add(comparison_frame, text="Comparison Results")
+        
+        # Treeview for results
+        tree_frame = ttk.Frame(comparison_frame)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Scrollbars
+        tree_scroll_y = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL)
+        tree_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+        tree_scroll_x = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL)
+        tree_scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
+        
+        # Results Tree
+        self.results_tree = ttk.Treeview(tree_frame, 
+                                        columns=("Status", "DB Field", "JSON Field", "Match Type"),
+                                        show="tree headings",
+                                        yscrollcommand=tree_scroll_y.set,
+                                        xscrollcommand=tree_scroll_x.set)
+        self.results_tree.heading("#0", text="Field")
+        self.results_tree.heading("Status", text="Status")
+        self.results_tree.heading("DB Field", text="Annexure Field")
+        self.results_tree.heading("JSON Field", text="JSON Field")
+        self.results_tree.heading("Match Type", text="Match Type")
+        
+        self.results_tree.column("#0", width=200)
+        self.results_tree.column("Status", width=100)
+        self.results_tree.column("DB Field", width=200)
+        self.results_tree.column("JSON Field", width=200)
+        self.results_tree.column("Match Type", width=150)
+        
+        self.results_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree_scroll_y.config(command=self.results_tree.yview)
+        tree_scroll_x.config(command=self.results_tree.xview)
+        
+        # Summary Tab
+        summary_frame = ttk.Frame(self.notebook)
+        self.notebook.add(summary_frame, text="Summary")
+        
+        self.summary_text = scrolledtext.ScrolledText(summary_frame, wrap=tk.WORD, height=20)
+        self.summary_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Progress Section
+        progress_frame = ttk.LabelFrame(main_frame, text="Processing Status", padding="10")
+        progress_frame.grid(row=3, column=0, columnspan=5, sticky=(tk.W, tk.E), pady=5)
+        progress_frame.columnconfigure(1, weight=1)
+        
+        ttk.Label(progress_frame, text="Status:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+        self.progress_status_var = tk.StringVar(value="Ready")
+        progress_status_label = ttk.Label(progress_frame, textvariable=self.progress_status_var, 
+                                         foreground="blue", font=("Arial", 9))
+        progress_status_label.grid(row=0, column=1, sticky=tk.W, padx=5, pady=5)
+        
+        self.progress_bar = ttk.Progressbar(progress_frame, mode='determinate', length=400)
+        self.progress_bar.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), padx=5, pady=5)
+        self.progress_bar.grid_remove()  # Hide initially
+        
+        # Action Buttons
+        button_frame = ttk.Frame(main_frame)
+        button_frame.grid(row=4, column=0, columnspan=5, pady=10)
+        
+        self.compare_button = ttk.Button(button_frame, text="Compare Fields", 
+                  command=self.compare_fields)
+        self.compare_button.pack(side=tk.LEFT, padx=5)
+        
+        self.show_unmatched_button = ttk.Button(button_frame, text="Show Unmatched Fields", 
+                  command=self.show_unmatched_fields)
+        self.show_unmatched_button.pack(side=tk.LEFT, padx=5)
+        
+        self.export_button = ttk.Button(button_frame, text="Export Results", 
+                  command=self.export_results)
+        self.export_button.pack(side=tk.LEFT, padx=5)
+        
+        self.export_unmatched_json_button = ttk.Button(button_frame, text="Export Fields Not Found Under Annexure", 
+                  command=self.export_unmatched_json_fields)
+        self.export_unmatched_json_button.pack(side=tk.LEFT, padx=5)
+        
+        self.show_special_chars_button = ttk.Button(button_frame, text="Show Special Characters", 
+                  command=self.show_special_characters)
+        self.show_special_chars_button.pack(side=tk.LEFT, padx=5)
+        
+        self.clear_button = ttk.Button(button_frame, text="Clear All", 
+                  command=self.clear_all)
+        self.clear_button.pack(side=tk.LEFT, padx=5)
+        
+        # Processing flag
+        self.is_processing = False
+        
+    def auto_load_config(self):
+        """Automatically load database list from config file on startup"""
+        try:
+            # Try to find config file - use resource_path for PyInstaller compatibility
+            config_file = resource_path("database_config.py")
+            
+            # If bundled file doesn't exist, try current directory (for development)
+            if not os.path.exists(config_file):
+                config_file = "database_config.py"
+            
+            # If still not found, try executable directory
+            if not os.path.exists(config_file):
+                if getattr(sys, 'frozen', False):
+                    exe_dir = os.path.dirname(sys.executable)
+                else:
+                    exe_dir = os.path.dirname(os.path.abspath(__file__))
+                config_file = os.path.join(exe_dir, "database_config.py")
+            
+            if not os.path.exists(config_file):
+                self.db_status_var.set(f"Error: Config file not found")
+                self.total_fields_var.set("0")
+                messagebox.showwarning("Config File Not Found", 
+                                      f"Could not find database_config.py\n\n"
+                                      f"Please ensure database_config.py is in the same folder as the application.")
+                return
+            
+            # Load from config file (just to get database list)
+            self.field_loader.load_from_config_file(config_file)
+            self.loader_data = self.field_loader.get_all_data()
+            
+            # Populate database dropdown
+            databases = self.field_loader.get_databases()
+            self.database_combo['values'] = databases
+            
+            if databases:
+                # Select first database by default
+                self.database_var.set(databases[0])
+                self.db_status_var.set(f"Found {len(databases)} annexure(s). Select an annexure and click 'Load Annexure Fields'")
+            else:
+                self.db_status_var.set("No annexures found in config file")
+            
+            logger.info(f"Loaded {len(databases)} databases from {config_file}")
+            
+        except Exception as e:
+            error_msg = f"Failed to load config: {str(e)}"
+            self.db_status_var.set(error_msg)
+            self.total_fields_var.set("0")
+            logger.error(error_msg)
+            messagebox.showerror("Error Loading Config", error_msg)
+    
+    def on_database_selected(self, event=None):
+        """Handle database selection change"""
+        # Just update status, don't load fields yet
+        database = self.database_var.get()
+        if database:
+            self.db_status_var.set(f"Annexure '{database}' selected. Click 'Load Annexure Fields' to load fields.")
+    
+    def load_database_fields(self):
+        """Load all fields from the selected database (all tables combined)"""
+        try:
+            database = self.database_var.get()
+            
+            if not database:
+                messagebox.showerror("Error", "Please select an annexure first")
+                return
+            
+            # Load ALL fields from the selected database (handles both simple and table structures)
+            self.all_db_fields = []
+            self.db_fields = {}  # Clear previous
+            
+            # Get all fields from database (no table name = gets all fields)
+            fields = self.field_loader.get_fields(database)
+            
+            # Also get category names (tables) from database for comparison
+            # Note: Only databases with dict structure have categories (e.g., "Pharmacokinetic Database")
+            # Databases with list structure (e.g., "Liceptor Database") will return empty list
+            # Category names in JSON should be compared against database categories when they exist
+            categories = self.field_loader.get_tables(database)
+            if categories:
+                # Add category names to fields list so they can be compared
+                # This only happens for databases that have categories defined
+                fields.extend(categories)
+            
+            if not fields:
+                messagebox.showwarning("Warning", 
+                                      f"No fields found in annexure '{database}'")
+                return
+            
+            # Store fields
+            self.all_db_fields = fields
+            self.db_fields[database] = fields
+            
+            # Update status
+            total_count = len(self.all_db_fields)
+            self.db_status_var.set(f"Loaded {total_count} fields from '{database}'")
+            self.total_fields_var.set(str(total_count))
+            
+            messagebox.showinfo("Success", 
+                               f"Loaded {total_count} fields from database '{database}'")
+            
+            logger.info(f"Loaded {total_count} fields from database '{database}'")
+            
+        except Exception as e:
+            error_msg = f"Failed to load annexure fields: {str(e)}"
+            self.db_status_var.set(error_msg)
+            self.total_fields_var.set("0")
+            logger.error(error_msg)
+            messagebox.showerror("Error", error_msg)
+    
+    def browse_json_folder(self):
+        """Browse for folder containing JSON files and process them in batches"""
+        folder = filedialog.askdirectory(title="Select Folder with JSON Files")
+        if folder:
+            try:
+                # Find all JSON files in the folder
+                json_files = glob.glob(os.path.join(folder, "*.json"))
+                
+                if not json_files:
+                    messagebox.showwarning("No JSON Files", 
+                                         f"No JSON files found in {folder}")
+                    return
+                
+                # Ask user for confirmation if many files
+                if len(json_files) > 100:
+                    response = messagebox.askyesno(
+                        "Confirm Batch Load",
+                        f"Found {len(json_files)} JSON files. This will process files during comparison to save memory. Continue?"
+                    )
+                    if not response:
+                        return
+                
+                # Store folder path and file list instead of loading all at once
+                self.json_folder = folder
+                self.json_files_list = json_files
+                self.json_fields = {}  # Clear previous loaded files
+                self.json_folder_var.set(folder)  # Update UI display
+                
+                messagebox.showinfo("Folder Selected", 
+                                   f"Selected folder with {len(json_files)} JSON files.\n"
+                                   f"Files will be processed during comparison to optimize memory usage.")
+                
+                logger.info(f"Selected folder with {len(json_files)} JSON files: {folder}")
+                
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to select folder: {str(e)}")
+                logger.error(f"Folder selection error: {str(e)}")
+    
+    def set_processing_state(self, is_processing: bool):
+        """Enable/disable UI elements during processing"""
+        self.is_processing = is_processing
+        state = tk.DISABLED if is_processing else tk.NORMAL
+        
+        self.compare_button.config(state=state)
+        self.show_unmatched_button.config(state=state)
+        self.export_button.config(state=state)
+        if hasattr(self, 'export_unmatched_json_button'):
+            self.export_unmatched_json_button.config(state=state)
+        if hasattr(self, 'show_special_chars_button'):
+            self.show_special_chars_button.config(state=state)
+        self.clear_button.config(state=state)
+        self.database_combo.config(state=state)
+        
+        if is_processing:
+            self.progress_bar.grid()
+            self.progress_status_var.set("Processing... Please wait")
+        else:
+            self.progress_bar.grid_remove()
+            self.progress_status_var.set("Ready")
+            self.progress_bar['value'] = 0
+    
+    def update_progress(self, current: int, total: int, message: str = ""):
+        """Update progress bar and status (thread-safe)"""
+        # Schedule UI update on main thread
+        self.root.after(0, self._update_progress_ui, current, total, message)
+    
+    def _update_progress_ui(self, current: int, total: int, message: str = ""):
+        """Internal method to update UI (runs on main thread)"""
+        if total > 0:
+            percentage = (current / total) * 100
+            self.progress_bar['value'] = current
+            self.progress_bar['maximum'] = total
+            # Format numbers with commas for readability (e.g., 200,000)
+            if total > 1000:
+                status_msg = f"Processing: {current:,}/{total:,} files ({percentage:.1f}%)"
+            else:
+                status_msg = f"Processing: {current}/{total} files ({percentage:.1f}%)"
+            if message:
+                status_msg += f" - {message}"
+            self.progress_status_var.set(status_msg)
+        else:
+            self.progress_status_var.set(message if message else "Processing...")
+    
+    def compare_fields(self):
+        """Compare database fields with JSON fields - starts background thread"""
+        try:
+            if self.is_processing:
+                messagebox.showwarning("Processing", "Comparison is already in progress. Please wait.")
+                return
+            
+            if not self.all_db_fields:
+                messagebox.showerror("Error", 
+                                   "No annexure fields loaded. Please check database_config.py")
+                return
+            
+            # Check if we have JSON files to process
+            if not self.json_files_list:
+                messagebox.showerror("Error", 
+                                    "Please select a JSON folder first")
+                return
+            
+            json_files_to_process = self.json_files_list
+            
+            # Clear all previous results and logs before starting new comparison
+            for item in self.results_tree.get_children():
+                self.results_tree.delete(item)
+            
+            self.summary_text.delete(1.0, tk.END)  # Clear summary
+            self.record_unmatched_info = {}  # Clear per-record unmatched info
+            self.fields_with_special_chars = {'db': [], 'json': []}  # Clear special character validation results
+            self.comparison_results = {}  # Clear comparison results
+            
+            # Set processing state
+            self.set_processing_state(True)
+            
+            # Initialize progress bar
+            total_files = len(json_files_to_process)
+            self.progress_bar['maximum'] = total_files
+            self.progress_bar['value'] = 0
+            
+            # Show initial message for very large batches
+            if total_files > 50000:
+                self.update_progress(0, total_files, f"Starting batch processing of {total_files:,} files... This may take a while.")
+                logger.info(f"Starting batch processing of {total_files:,} files")
+            else:
+                self.update_progress(0, total_files, "Starting comparison...")
+            
+            # Start processing in background thread
+            thread = threading.Thread(
+                target=self._process_comparison_batch,
+                args=(json_files_to_process,),
+                daemon=True
+            )
+            thread.start()
+            
+        except Exception as e:
+            self.set_processing_state(False)
+            messagebox.showerror("Error", f"Failed to start comparison: {str(e)}")
+            logger.error(f"Comparison start error: {str(e)}", exc_info=True)
+    
+    def _process_comparison_batch(self, json_files_to_process: List[str]):
+        """Process comparison in background thread with proper batch processing"""
+        try:
+            # Get field category mapping for the selected database
+            database = self.database_var.get()
+            field_category_mapping = {}
+            if database:
+                field_category_mapping = self.field_loader.get_field_category_mapping(database)
+            
+            total_files = len(json_files_to_process)
+            processed = 0
+            
+            # Determine optimal batch size based on file count
+            # For very large datasets (200k+ files), process one at a time to minimize memory
+            if total_files > 50000:
+                batch_size = 1
+                progress_update_interval = 1000  # Update progress every 1000 files
+            elif total_files > 10000:
+                batch_size = 1
+                progress_update_interval = 100  # Update progress every 100 files
+            elif total_files > 1000:
+                batch_size = 10
+                progress_update_interval = 50  # Update progress every 50 files
+            else:
+                batch_size = 50
+                progress_update_interval = 10  # Update progress every 10 files
+            
+            # For large datasets, use incremental aggregation
+            if total_files > 1000:
+                from collections import defaultdict
+                field_stats = defaultdict(lambda: {'matched': 0, 'unmatched_db': 0, 'unmatched_json': 0, 'category_null': 0})
+                file_stats = {'success': 0, 'failed': 0}
+                
+                # Process files in batches
+                for i in range(0, total_files, batch_size):
+                    batch = json_files_to_process[i:i + batch_size]
+                    
+                    for json_file in batch:
+                        try:
+                            # Load fields on-the-fly
+                            if json_file in self.json_fields:
+                                json_fields = self.json_fields[json_file]
+                            else:
+                                json_path = self.json_path_var.get()
+                                json_fields = self.json_parser.extract_fields(json_file, json_path)
+                                self.json_fields[json_file] = json_fields
+                            
+                            # Check for null categories in JSON
+                            null_categories = self.json_parser.check_null_categories(json_file, json_path)
+                            
+                            # Get array field mapping (which fields are in arrays)
+                            array_field_mapping = self.json_parser.get_array_field_mapping(json_file, json_path)
+                            
+                            # Load JSON data for value validation
+                            json_data = self.json_parser.load_json(json_file)
+                            
+                            results = self.comparator.compare(
+                                self.all_db_fields, 
+                                json_fields, 
+                                "All Databases", 
+                                json_file,
+                                field_category_mapping=field_category_mapping,
+                                null_categories=null_categories,
+                                array_field_mapping=array_field_mapping,
+                                json_data=json_data
+                            )
+                            
+                            # Collect validation results
+                            validation_results = self.comparator.get_validation_results()
+                            self.fields_with_special_chars['db'].extend(validation_results['db'])
+                            self.fields_with_special_chars['json'].extend(validation_results['json'])
+                            self.comparator.clear_validation_results()
+                            
+                            # Aggregate results immediately
+                            for result in results:
+                                field_name = result.get('field_name', '')
+                                status = result.get('status', '')
+                                match_type = result.get('match_type', '')
+                                
+                                if status == 'matched':
+                                    field_stats[field_name]['matched'] += 1
+                                elif status == 'unmatched_db':
+                                    if match_type != 'category_null':
+                                        field_stats[field_name]['unmatched_db'] += 1
+                                elif status == 'unmatched_json':
+                                    field_stats[field_name]['unmatched_json'] += 1
+                            
+                            # Per-record logging for multi-record files (only log records with unmatched fields)
+                            records = self.json_parser.get_records(json_file, json_path)
+                            if len(records) > 1:
+                                records_with_unmatched = []
+                                total_unmatched_json = 0
+                                total_unmatched_db = 0
+                                
+                                logger.info(f"File {os.path.basename(json_file)} has {len(records)} records - checking each record for unmatched fields")
+                                
+                                # Update UI to show multi-record processing
+                                self.update_progress(processed, total_files, f"Processing {os.path.basename(json_file)}: {len(records)} records")
+                                
+                                for record_idx, record in enumerate(records, 1):
+                                    # Update UI with current record being processed
+                                    if record_idx % 100 == 0 or record_idx == 1 or record_idx == len(records):
+                                        self.update_progress(processed, total_files, f"Processing {os.path.basename(json_file)}: Record {record_idx}/{len(records)}")
+                                    # Extract fields from this specific record
+                                    record_fields = self.json_parser.extract_fields_from_record(record)
+                                    
+                                    # Check for null categories in this record
+                                    record_null_categories = {}
+                                    if isinstance(record, dict):
+                                        for key, value in record.items():
+                                            if value is None:
+                                                record_null_categories[key] = True
+                                            elif isinstance(value, list) and len(value) == 0:
+                                                record_null_categories[key] = True
+                                            else:
+                                                record_null_categories[key] = False
+                                    
+                                    # Get array field mapping for this record
+                                    record_array_mapping = {}
+                                    if isinstance(record, dict):
+                                        for key, value in record.items():
+                                            if isinstance(value, list):
+                                                for item in value:
+                                                    if isinstance(item, dict):
+                                                        for field_name in item.keys():
+                                                            normalized_field = field_name.replace(' ', '').replace('_', '').replace('-', '').replace('.', '').lower()
+                                                            record_array_mapping[normalized_field] = key
+                                    
+                                    # Compare this record's fields
+                                    record_results = self.comparator.compare(
+                                        self.all_db_fields,
+                                        record_fields,
+                                        "All Databases",
+                                        f"{json_file} (Record {record_idx})",
+                                        field_category_mapping=field_category_mapping,
+                                        null_categories=record_null_categories,
+                                        array_field_mapping=record_array_mapping,
+                                        json_data=record
+                                    )
+                                    
+                                    # Find unmatched fields for this record
+                                    unmatched_json_fields = [r for r in record_results if r.get('status') == 'unmatched_json']
+                                    unmatched_db_fields = [r for r in record_results if r.get('status') == 'unmatched_db']
+                                    
+                                    if unmatched_json_fields or unmatched_db_fields:
+                                        records_with_unmatched.append(record_idx)
+                                        total_unmatched_json += len(unmatched_json_fields)
+                                        total_unmatched_db += len(unmatched_db_fields)
+                                        
+                                        # Store per-record unmatched info for summary
+                                        if json_file not in self.record_unmatched_info:
+                                            self.record_unmatched_info[json_file] = {}
+                                        
+                                        self.record_unmatched_info[json_file][record_idx] = {
+                                            'unmatched_json': [r.get('field_name', '') for r in unmatched_json_fields],
+                                            'unmatched_db': [r.get('field_name', '') for r in unmatched_db_fields]
+                                        }
+                                        
+                                        # Log details for this record
+                                        logger.warning(f"Record {record_idx}/{len(records)} in {os.path.basename(json_file)} has unmatched fields:")
+                                        if unmatched_json_fields:
+                                            unmatched_list = [r.get('field_name', '') for r in unmatched_json_fields]
+                                            logger.warning(f"  - Fields not found under annexure ({len(unmatched_list)}): {', '.join(unmatched_list[:10])}{'...' if len(unmatched_list) > 10 else ''}")
+                                        if unmatched_db_fields:
+                                            unmatched_list = [r.get('field_name', '') for r in unmatched_db_fields]
+                                            logger.warning(f"  - Missing Annexure fields ({len(unmatched_list)}): {', '.join(unmatched_list[:10])}{'...' if len(unmatched_list) > 10 else ''}")
+                                
+                                # Update UI with summary
+                                if records_with_unmatched:
+                                    summary_msg = f"{os.path.basename(json_file)}: {len(records_with_unmatched)}/{len(records)} records have unmatched fields"
+                                    self.update_progress(processed, total_files, summary_msg)
+                                    logger.warning(f"Summary for {os.path.basename(json_file)}: {len(records_with_unmatched)}/{len(records)} records have unmatched fields (Records: {', '.join(map(str, records_with_unmatched[:20]))}{'...' if len(records_with_unmatched) > 20 else ''})")
+                                else:
+                                    summary_msg = f"{os.path.basename(json_file)}: All {len(records)} records match correctly"
+                                    self.update_progress(processed, total_files, summary_msg)
+                                    logger.info(f"All {len(records)} records in {os.path.basename(json_file)} match database fields correctly")
+                            
+                            file_stats['success'] += 1
+                            processed += 1
+                            
+                            # Update progress at intervals (throttled for large datasets)
+                            if processed % progress_update_interval == 0 or processed == total_files:
+                                # For very large datasets, show percentage only
+                                if total_files > 50000:
+                                    self.update_progress(processed, total_files, f"Processed {processed:,} files")
+                                else:
+                                    self.update_progress(processed, total_files, f"Processing: {os.path.basename(json_file)}")
+                            
+                            # Log progress periodically
+                            if processed % 1000 == 0:
+                                percentage = (processed * 100) // total_files
+                                logger.info(f"Processed {processed:,}/{total_files:,} files... ({percentage}%)")
+                                import gc
+                                gc.collect()
+                            elif processed % 100 == 0 and total_files <= 10000:
+                                # More frequent logging for smaller datasets
+                                import gc
+                                gc.collect()
+                        
+                        except Exception as e:
+                            file_stats['failed'] += 1
+                            processed += 1
+                            # Only log errors periodically for very large datasets
+                            if total_files <= 10000 or processed % 1000 == 0:
+                                logger.error(f"Failed to process {json_file}: {str(e)}")
+                            # Update progress at intervals
+                            if processed % progress_update_interval == 0:
+                                self.update_progress(processed, total_files, f"Errors: {file_stats['failed']}")
+                            continue
+                    
+                    # Clear cache more aggressively for very large datasets
+                    if total_files > 50000:
+                        # Clear cache every 100 files for 200k+ files
+                        if i > 0 and i % 100 == 0:
+                            self.json_fields.clear()
+                            import gc
+                            gc.collect()
+                            if i % 10000 == 0:
+                                logger.info(f"Cleared cache after processing {processed:,} files")
+                    elif i > 0 and i % (batch_size * 10) == 0:
+                        self.json_fields.clear()
+                        import gc
+                        gc.collect()
+                        logger.info(f"Cleared cache after processing {processed:,} files")
+                
+                logger.info(f"Completed processing {processed} JSON files")
+                self.update_progress(total_files, total_files, "Aggregating results...")
+                
+                # Convert aggregated stats to results format
+                all_results = []
+                for field_name, stats in field_stats.items():
+                    if stats['matched'] > 0:
+                        all_results.append({
+                            'field_name': field_name,
+                            'status': 'matched',
+                            'match_type': f"matched ({stats['matched']} times)",
+                            'db_field': field_name,
+                            'json_field': field_name
+                        })
+                    elif stats['unmatched_db'] > 0:
+                        all_results.append({
+                            'field_name': field_name,
+                            'status': 'unmatched_db',
+                            'match_type': f"not_found ({stats['unmatched_db']} times)",
+                            'db_field': field_name,
+                            'json_field': ''
+                        })
+                    elif stats['unmatched_json'] > 0:
+                        all_results.append({
+                            'field_name': field_name,
+                            'status': 'unmatched_json',
+                            'match_type': f"not_found ({stats['unmatched_json']} times)",
+                            'db_field': '',
+                            'json_field': field_name
+                        })
+                
+                # Schedule UI update on main thread
+                self.root.after(0, self._display_results_complete, all_results, file_stats, processed)
+                
+            else:
+                # For smaller batches, collect all results
+                all_results = []
+                
+                for i in range(0, total_files, batch_size):
+                    batch = json_files_to_process[i:i + batch_size]
+                    
+                    for json_file in batch:
+                        try:
+                            # Load fields on-the-fly
+                            if json_file in self.json_fields:
+                                json_fields = self.json_fields[json_file]
+                            else:
+                                json_path = self.json_path_var.get()
+                                json_fields = self.json_parser.extract_fields(json_file, json_path)
+                                self.json_fields[json_file] = json_fields
+                            
+                            # Check for null categories
+                            null_categories = self.json_parser.check_null_categories(json_file, self.json_path_var.get())
+                            
+                            # Get array field mapping (which fields are in arrays)
+                            array_field_mapping = self.json_parser.get_array_field_mapping(json_file, self.json_path_var.get())
+                            
+                            # Load JSON data for value validation
+                            json_data = self.json_parser.load_json(json_file)
+                            
+                            results = self.comparator.compare(
+                                self.all_db_fields, 
+                                json_fields, 
+                                "All Databases", 
+                                json_file,
+                                field_category_mapping=field_category_mapping,
+                                null_categories=null_categories,
+                                array_field_mapping=array_field_mapping,
+                                json_data=json_data
+                            )
+                            all_results.extend(results)
+                            
+                            # Collect validation results
+                            validation_results = self.comparator.get_validation_results()
+                            self.fields_with_special_chars['db'].extend(validation_results['db'])
+                            self.fields_with_special_chars['json'].extend(validation_results['json'])
+                            self.comparator.clear_validation_results()
+                            
+                            # Per-record logging for multi-record files (only log records with unmatched fields)
+                            json_path = self.json_path_var.get()
+                            records = self.json_parser.get_records(json_file, json_path)
+                            if len(records) > 1:
+                                # Update UI to show multi-record processing
+                                self.update_progress(processed, total_files, f"Processing {os.path.basename(json_file)}: {len(records)} records")
+                                
+                                for record_idx, record in enumerate(records, 1):
+                                    # Update UI with current record being processed (every 100 records or at start/end)
+                                    if record_idx % 100 == 0 or record_idx == 1 or record_idx == len(records):
+                                        self.update_progress(processed, total_files, f"Processing {os.path.basename(json_file)}: Record {record_idx}/{len(records)}")
+                                    
+                                    # Extract fields from this specific record
+                                    record_fields = self.json_parser.extract_fields_from_record(record)
+                                    
+                                    # Check for null categories in this record
+                                    record_null_categories = {}
+                                    if isinstance(record, dict):
+                                        for key, value in record.items():
+                                            if value is None:
+                                                record_null_categories[key] = True
+                                            elif isinstance(value, list) and len(value) == 0:
+                                                record_null_categories[key] = True
+                                            else:
+                                                record_null_categories[key] = False
+                                    
+                                    # Get array field mapping for this record
+                                    record_array_mapping = {}
+                                    if isinstance(record, dict):
+                                        for key, value in record.items():
+                                            if isinstance(value, list):
+                                                for item in value:
+                                                    if isinstance(item, dict):
+                                                        for field_name in item.keys():
+                                                            normalized_field = field_name.replace(' ', '').replace('_', '').replace('-', '').replace('.', '').lower()
+                                                            record_array_mapping[normalized_field] = key
+                                    
+                                    # Compare this record's fields
+                                    record_results = self.comparator.compare(
+                                        self.all_db_fields,
+                                        record_fields,
+                                        "All Databases",
+                                        f"{json_file} (Record {record_idx})",
+                                        field_category_mapping=field_category_mapping,
+                                        null_categories=record_null_categories,
+                                        array_field_mapping=record_array_mapping,
+                                        json_data=record
+                                    )
+                                    
+                                    # Find unmatched fields for this record
+                                    unmatched_json_fields = [r for r in record_results if r.get('status') == 'unmatched_json']
+                                    unmatched_db_fields = [r for r in record_results if r.get('status') == 'unmatched_db']
+                                    
+                                    if unmatched_json_fields or unmatched_db_fields:
+                                        # Store per-record unmatched info for summary
+                                        if json_file not in self.record_unmatched_info:
+                                            self.record_unmatched_info[json_file] = {}
+                                        
+                                        self.record_unmatched_info[json_file][record_idx] = {
+                                            'unmatched_json': [r.get('field_name', '') for r in unmatched_json_fields],
+                                            'unmatched_db': [r.get('field_name', '') for r in unmatched_db_fields]
+                                        }
+                            
+                            processed += 1
+                            
+                            # Update progress at intervals
+                            if processed % progress_update_interval == 0 or processed == total_files:
+                                if total_files > 50000:
+                                    self.update_progress(processed, total_files, f"Processed {processed:,} files")
+                                else:
+                                    self.update_progress(processed, total_files, f"Processing: {os.path.basename(json_file)}")
+                            
+                            if processed % 1000 == 0:
+                                logger.info(f"Processed {processed:,}/{total_files:,} files...")
+                            elif processed % 100 == 0 and total_files <= 10000:
+                                logger.info(f"Processed {processed}/{total_files} files...")
+                        
+                        except Exception as e:
+                            if total_files <= 10000 or processed % 1000 == 0:
+                                logger.error(f"Failed to process {json_file}: {str(e)}")
+                            processed += 1
+                            if processed % progress_update_interval == 0:
+                                self.update_progress(processed, total_files, f"Processing...")
+                            continue
+                    
+                    # Clear cache periodically (more aggressive for large datasets)
+                    if total_files > 50000:
+                        if i > 0 and i % 100 == 0:
+                            self.json_fields.clear()
+                            import gc
+                            gc.collect()
+                    elif i > 0 and i % (batch_size * 5) == 0:
+                        recent_files = list(self.json_fields.keys())[-batch_size:]
+                        self.json_fields = {f: self.json_fields[f] for f in recent_files if f in self.json_fields}
+                        import gc
+                        gc.collect()
+                
+                logger.info(f"Completed processing {processed} JSON files")
+                
+                self.update_progress(total_files, total_files, "Processing results...")
+                
+                # Schedule UI update on main thread
+                self.root.after(0, self._display_results_complete, all_results, None, processed)
+                
+        except Exception as e:
+            logger.error(f"Batch processing error: {str(e)}", exc_info=True)
+            self.root.after(0, self._processing_error, str(e))
+    
+    def _display_results_complete(self, all_results: List[Dict], file_stats: Dict = None, processed: int = 0):
+        """Display results on main thread"""
+        try:
+            # For large batches, use aggregated view
+            if len(all_results) > 5000:
+                self._display_aggregated_results(all_results)
+                if file_stats:
+                    messagebox.showinfo("Processing Complete", 
+                                       f"Processed {file_stats['success']} files successfully.\n"
+                                       f"Failed: {file_stats['failed']}\n"
+                                       f"Total: {processed} files")
+            else:
+                # Display individual results (deduplicate by field name)
+                self.update_progress(len(all_results), len(all_results), "Displaying results...")
+                matched_count = 0
+                unmatched_db_count = 0
+                unmatched_json_count = 0
+                
+                # Track which fields we've already added to avoid duplicates
+                seen_fields = set()
+                
+                for result in all_results:
+                    status = result['status']
+                    match_type = result.get('match_type', 'N/A')
+                    field_name = result['field_name']
+                    
+                    # Create a unique key for this field and status combination
+                    # This allows the same field to appear once per status type
+                    field_key = (field_name, status)
+                    
+                    # Skip if we've already added this field with this status
+                    if field_key in seen_fields:
+                        # Still count it for statistics
+                        if status == 'matched':
+                            matched_count += 1
+                        elif status == 'unmatched_db':
+                            unmatched_db_count += 1
+                        elif status == 'unmatched_json':
+                            unmatched_json_count += 1
+                        continue
+                    
+                    seen_fields.add(field_key)
+                    
+                    # Display status text for UI
+                    display_status = status
+                    if status == 'unmatched_json':
+                        display_status = 'not found under annexure'
+                    elif status == 'unmatched_db':
+                        display_status = 'missing in JSON'
+                    
+                    if status == 'matched':
+                        matched_count += 1
+                        tag = 'matched'
+                    elif status == 'unmatched_db':
+                        unmatched_db_count += 1
+                        tag = 'unmatched_db'
+                    else:
+                        unmatched_json_count += 1
+                        tag = 'unmatched_json'
+                    
+                    self.results_tree.insert("", tk.END,
+                                           text=field_name,
+                                           values=(display_status, 
+                                                  result.get('db_field', ''),
+                                                  result.get('json_field', ''),
+                                                  match_type),
+                                           tags=(tag,))
+                
+                # Configure tags for coloring
+                self.results_tree.tag_configure('matched', background='#d4edda')
+                self.results_tree.tag_configure('unmatched_db', background='#f8d7da')
+                self.results_tree.tag_configure('unmatched_json', background='#fff3cd')
+                
+                # Update summary
+                self.update_summary(matched_count, unmatched_db_count, unmatched_json_count)
+                
+                # Reset processing state
+                self.set_processing_state(False)
+                
+                messagebox.showinfo("Comparison Complete", 
+                                  f"Comparison completed!\n"
+                                  f"Matched: {matched_count}\n"
+                                  f"Missing in JSON: {unmatched_db_count}\n"
+                                  f"Not found under annexure: {unmatched_json_count}")
+        except Exception as e:
+            logger.error(f"Display results error: {str(e)}", exc_info=True)
+            self.set_processing_state(False)
+            messagebox.showerror("Error", f"Failed to display results: {str(e)}")
+    
+    def _processing_error(self, error_msg: str):
+        """Handle processing error on main thread"""
+        self.set_processing_state(False)
+        messagebox.showerror("Error", f"Failed to compare fields: {error_msg}")
+    
+    def _display_aggregated_results(self, all_results: List[Dict]):
+        """Display aggregated results for large datasets to save memory"""
+        from collections import defaultdict
+        
+        # Aggregate results by field name
+        field_stats = defaultdict(lambda: {'matched': 0, 'unmatched_db': 0, 'unmatched_json': 0, 'category_null': 0})
+        
+        for result in all_results:
+            field_name = result.get('field_name', '')
+            status = result.get('status', '')
+            match_type = result.get('match_type', '')
+            
+            if status == 'matched':
+                field_stats[field_name]['matched'] += 1
+            elif status == 'unmatched_db':
+                if match_type == 'category_null':
+                    field_stats[field_name]['category_null'] += 1
+                else:
+                    field_stats[field_name]['unmatched_db'] += 1
+            elif status == 'unmatched_json':
+                field_stats[field_name]['unmatched_json'] += 1
+        
+        # Clear previous results
+        for item in self.results_tree.get_children():
+            self.results_tree.delete(item)
+        
+        # Display aggregated results
+        matched_count = 0
+        unmatched_db_count = 0
+        unmatched_json_count = 0
+        category_null_count = 0
+        
+        for field_name, stats in sorted(field_stats.items()):
+            if stats['matched'] > 0:
+                matched_count += stats['matched']
+                tag = 'matched'
+                status = 'matched'
+                match_type = f"matched ({stats['matched']} times)"
+            # Skip category_null - don't display as unmatched
+            elif stats['unmatched_db'] > 0:
+                unmatched_db_count += stats['unmatched_db']
+                tag = 'unmatched_db'
+                status = 'unmatched_db'
+                match_type = f"not_found ({stats['unmatched_db']} times)"
+            elif stats['unmatched_json'] > 0:
+                unmatched_json_count += stats['unmatched_json']
+                tag = 'unmatched_json'
+                status = 'unmatched_json'
+                display_status = 'not found under annexure'
+                match_type = f"not_found ({stats['unmatched_json']} times)"
+            else:
+                # Skip fields that only have category_null
+                continue
+            
+            # Set display_status for unmatched_db as well
+            if status == 'unmatched_db':
+                display_status = 'missing in JSON'
+            elif status == 'matched':
+                display_status = 'matched'
+            
+            self.results_tree.insert("", tk.END,
+                                   text=field_name,
+                                   values=(display_status, '', '', match_type),
+                                   tags=(tag,))
+        
+        # Configure tags for coloring
+        self.results_tree.tag_configure('matched', background='#d4edda')
+        self.results_tree.tag_configure('unmatched_db', background='#f8d7da')
+        self.results_tree.tag_configure('category_null', background='#ffcccc')
+        self.results_tree.tag_configure('unmatched_json', background='#fff3cd')
+        
+        # Update summary (category_null excluded from unmatched count)
+        self.update_summary(matched_count, unmatched_db_count, unmatched_json_count)
+        
+        # Reset processing state
+        self.set_processing_state(False)
+        
+        messagebox.showinfo("Aggregated Results", 
+                           f"Aggregated results displayed!\n\n"
+                           f"Unique Fields: {len(field_stats)}\n"
+                           f"Total Matches: {matched_count}\n"
+                           f"Missing in JSON: {unmatched_db_count}\n"
+                           f"Not found under annexure: {unmatched_json_count}\n\n"
+                           f"Note: Fields with null/empty arrays are excluded from unmatched count.")
+    
+    def update_summary(self, matched, unmatched_db, unmatched_json):
+        """Update summary tab"""
+        self.summary_text.delete(1.0, tk.END)
+        
+        summary = f"""
+FIELD COMPARISON SUMMARY
+{'='*50}
+
+ANNEXURE FIELDS (All Annexures Combined):
+{'-'*50}
+Total Fields: {len(self.all_db_fields)}
+Total Annexures: {len(self.field_loader.get_databases()) if self.loader_data else 0}
+
+Fields from all annexures/tables:
+{', '.join(self.all_db_fields[:50])}
+{f'... and {len(self.all_db_fields) - 50} more fields' if len(self.all_db_fields) > 50 else ''}
+"""
+        
+        summary += f"\n\nJSON FIELDS:\n{'-'*50}\n"
+        for json_file, fields in self.json_fields.items():
+            summary += f"\nFile: {os.path.basename(json_file)}\n"
+            summary += f"Total Fields: {len(fields)}\n"
+            summary += f"Fields: {', '.join(fields)}\n"
+        
+        summary += f"\n\nCOMPARISON RESULTS:\n{'-'*50}\n"
+        summary += f"Matched Fields: {matched}\n"
+        summary += f"Missing in JSON: {unmatched_db}\n"
+        summary += f"Not found under annexure: {unmatched_json}\n"
+        summary += f"Total Compared: {matched + unmatched_db + unmatched_json}\n"
+        
+        # Add unmatched fields details
+        unmatched_fields = self.get_unmatched_fields()
+        if unmatched_fields['unmatched_db'] or unmatched_fields['unmatched_json'] or unmatched_fields['category_null']:
+            summary += f"\n\nUNMATCHED FIELDS DETAILS:\n{'-'*50}\n"
+            
+            if unmatched_fields['unmatched_db']:
+                summary += f"\nMissing in JSON Fields ({len(unmatched_fields['unmatched_db'])}):\n"
+                for field_info in unmatched_fields['unmatched_db']:
+                    summary += f"  - {field_info['field_name']}: {field_info['match_type']}\n"
+            
+            if unmatched_fields['category_null']:
+                summary += f"\nFields with Null Categories ({len(unmatched_fields['category_null'])}):\n"
+                for field_info in unmatched_fields['category_null']:
+                    summary += f"  - {field_info['field_name']}: {field_info['match_type']}\n"
+            
+            if unmatched_fields['unmatched_json']:
+                summary += f"\nFields not found under annexure ({len(unmatched_fields['unmatched_json'])}):\n"
+                for field_info in unmatched_fields['unmatched_json']:
+                    summary += f"  - {field_info['field_name']}: {field_info['match_type']}\n"
+        
+        # Add per-record details for multi-record files
+        # First, check if we have any multi-record files
+        has_multi_record_files = False
+        for json_file in self.json_fields.keys():
+            records = self.json_parser.get_records(json_file)
+            if len(records) > 1:
+                has_multi_record_files = True
+                break
+        
+        if has_multi_record_files:
+            summary += f"\n\nPER-RECORD ANALYSIS (Multi-Record Files):\n{'-'*50}\n"
+            
+            # Check all JSON files to see if any are multi-record
+            for json_file, fields in self.json_fields.items():
+                records = self.json_parser.get_records(json_file)
+                if len(records) > 1:
+                    # This is a multi-record file
+                    total_records = len(records)
+                    record_info = self.record_unmatched_info.get(json_file, {})
+                    records_with_issues = len(record_info)
+                    
+                    summary += f"\nFile: {os.path.basename(json_file)}\n"
+                    summary += f"Total Records: {total_records}\n"
+                    summary += f"Records with Unmatched Fields: {records_with_issues}\n"
+                    
+                    if records_with_issues > 0:
+                        summary += f"\nRecords with Issues:\n"
+                        # Show ALL records with issues (user requested to see all records)
+                        all_record_numbers = sorted(list(record_info.keys()))
+                        for record_idx in all_record_numbers:
+                            info = record_info[record_idx]
+                            summary += f"  Record {record_idx}:\n"
+                            if info.get('unmatched_json'):
+                                unmatched_list = info['unmatched_json']
+                                summary += f"    - Fields not found under annexure ({len(unmatched_list)}): {', '.join(unmatched_list[:5])}{'...' if len(unmatched_list) > 5 else ''}\n"
+                            if info.get('unmatched_db'):
+                                unmatched_list = info['unmatched_db']
+                                summary += f"    - Missing Annexure fields ({len(unmatched_list)}): {', '.join(unmatched_list[:5])}{'...' if len(unmatched_list) > 5 else ''}\n"
+                    else:
+                        summary += f"  ✓ All {total_records} records match annexure fields correctly\n"
+        
+        # Add special character validation results (always show section)
+        summary += f"\n\nSPECIAL CHARACTER VALIDATION:\n{'-'*50}\n"
+        summary += f"Fields with special characters in VALUES (excluding HELM, MolStructure, SMILES fields):\n\n"
+        
+        if not self.fields_with_special_chars['db'] and not self.fields_with_special_chars['json']:
+            summary += f"No special characters found in field values.\n\n"
+        else:
+            if self.fields_with_special_chars['db']:
+                # Group by field name to show unique fields with their special characters
+                field_to_chars = {}
+                for f in self.fields_with_special_chars['db']:
+                    field_name = f['field']
+                    special_chars = f.get('special_chars', [])
+                    if field_name not in field_to_chars:
+                        field_to_chars[field_name] = set()
+                    field_to_chars[field_name].update(special_chars)
+                
+                unique_db_fields = sorted(field_to_chars.keys())
+                summary += f"Annexure Fields ({len(unique_db_fields)}):\n"
+                for field in unique_db_fields:
+                    chars_list = sorted(list(field_to_chars[field]))
+                    chars_str = ', '.join([f"'{c}'" for c in chars_list])
+                    summary += f"  - {field}: special characters [{chars_str}]\n"
+            
+            if self.fields_with_special_chars['json']:
+                # Group by field name to show unique fields with their special characters, file names, and line numbers
+                # Only include entries that actually have special characters
+                field_to_info = {}
+                for f in self.fields_with_special_chars['json']:
+                    field_name = f['field']
+                    special_chars = f.get('special_chars', [])
+                    
+                    # Skip if no special characters found (shouldn't happen, but double-check)
+                    if not special_chars or len(special_chars) == 0:
+                        continue
+                    
+                    sample_value = f.get('sample_value', '')
+                    file_path = f.get('file', '')
+                    line_number = f.get('line_number')
+                    
+                    if field_name not in field_to_info:
+                        field_to_info[field_name] = {
+                            'special_chars': set(),
+                            'sample_value': sample_value,
+                            'files': []  # List of (file, line_number) tuples
+                        }
+                    field_to_info[field_name]['special_chars'].update(special_chars)
+                    # Keep the first sample value found
+                    if not field_to_info[field_name]['sample_value']:
+                        field_to_info[field_name]['sample_value'] = sample_value
+                    # Add file and line number info
+                    if file_path:
+                        file_name = os.path.basename(file_path)
+                        field_to_info[field_name]['files'].append((file_name, line_number))
+                
+                unique_json_fields = sorted(field_to_info.keys())
+                summary += f"\nJSON Fields ({len(unique_json_fields)}):\n"
+                for field in unique_json_fields:
+                    info = field_to_info[field]
+                    chars_list = sorted(list(info['special_chars']))
+                    chars_str = ', '.join([f"'{c}'" for c in chars_list])
+                    sample = info['sample_value']
+                    
+                    # Build file and line number info
+                    file_info_parts = []
+                    for file_name, line_num in info['files']:
+                        if line_num:
+                            file_info_parts.append(f"{file_name}:{line_num}")
+                        else:
+                            file_info_parts.append(file_name)
+                    file_info = ", ".join(file_info_parts) if file_info_parts else ""
+                    
+                    if sample:
+                        sample_display = sample[:80] + '...' if len(sample) > 80 else sample
+                        if file_info:
+                            summary += f"  - {field}: special characters [{chars_str}], file: {file_info}, sample value: \"{sample_display}\"\n"
+                        else:
+                            summary += f"  - {field}: special characters [{chars_str}], sample value: \"{sample_display}\"\n"
+                    else:
+                        if file_info:
+                            summary += f"  - {field}: special characters [{chars_str}], file: {file_info}\n"
+                        else:
+                            summary += f"  - {field}: special characters [{chars_str}]\n"
+        
+        self.summary_text.insert(1.0, summary)
+    
+    def show_unmatched_fields(self):
+        """Display unmatched fields in a message box"""
+        unmatched_fields = self.get_unmatched_fields()
+        
+        if not unmatched_fields['unmatched_db'] and not unmatched_fields['unmatched_json'] and not unmatched_fields['category_null']:
+            messagebox.showinfo("Unmatched Fields", "No unmatched fields found. All fields are matched!")
+            return
+        
+        message = "UNMATCHED FIELDS REPORT\n" + "="*60 + "\n\n"
+        
+        if unmatched_fields['unmatched_db']:
+            message += f"MISSING IN JSON FIELDS ({len(unmatched_fields['unmatched_db'])}):\n"
+            message += "-"*60 + "\n"
+            for field_info in unmatched_fields['unmatched_db']:
+                message += f"  • {field_info['field_name']}\n"
+                message += f"    Status: {field_info['match_type']}\n\n"
+        
+        if unmatched_fields['category_null']:
+            message += f"FIELDS WITH NULL CATEGORIES ({len(unmatched_fields['category_null'])}):\n"
+            message += "-"*60 + "\n"
+            for field_info in unmatched_fields['category_null']:
+                message += f"  • {field_info['field_name']}\n"
+                message += f"    Status: {field_info['match_type']}\n\n"
+        
+        if unmatched_fields['unmatched_json']:
+            message += f"FIELDS NOT FOUND UNDER ANNEXURE ({len(unmatched_fields['unmatched_json'])}):\n"
+            message += "-"*60 + "\n"
+            for field_info in unmatched_fields['unmatched_json']:
+                message += f"  • {field_info['field_name']}\n"
+                message += f"    Status: {field_info['match_type']}\n\n"
+        
+        # Create a scrolled text window for large lists
+        if len(message) > 2000:
+            # Create a new window for displaying large results
+            window = tk.Toplevel(self.root)
+            window.title("Unmatched Fields Report")
+            window.geometry("700x500")
+            
+            text_widget = scrolledtext.ScrolledText(window, wrap=tk.WORD, padx=10, pady=10)
+            text_widget.pack(fill=tk.BOTH, expand=True)
+            text_widget.insert(1.0, message)
+            text_widget.config(state=tk.DISABLED)
+            
+            ttk.Button(window, text="Close", command=window.destroy).pack(pady=5)
+        else:
+            messagebox.showinfo("Unmatched Fields", message)
+    
+    def show_evolvus_id_unmatched(self):
+        """Display unmatched fields specifically for evolvus_id (excluding null array fields)"""
+        unmatched_fields = self.get_unmatched_fields_for_evolvus_id()
+        
+        if not unmatched_fields['unmatched_db'] and not unmatched_fields['unmatched_json']:
+            messagebox.showinfo("Evolvus ID Unmatched Fields", 
+                              "No unmatched fields found for evolvus_id.\n\n"
+                              "Note: Fields with null/empty arrays are excluded from unmatched list.")
+            return
+        
+        message = "UNMATCHED FIELDS FOR EVOLVUS_ID\n"
+        message += "="*70 + "\n\n"
+        message += "Note: Fields with null/empty arrays are excluded.\n\n"
+        
+        if unmatched_fields['unmatched_db']:
+            message += f"MISSING IN JSON FIELDS ({len(unmatched_fields['unmatched_db'])}):\n"
+            message += "-"*70 + "\n"
+            for field_info in unmatched_fields['unmatched_db']:
+                message += f"  • {field_info['field_name']}\n"
+                message += f"    Status: {field_info['match_type']}\n"
+                if field_info.get('category'):
+                    message += f"    Category: {field_info['category']}\n"
+                message += "\n"
+        
+        if unmatched_fields['unmatched_json']:
+            message += f"FIELDS NOT FOUND UNDER ANNEXURE ({len(unmatched_fields['unmatched_json'])}):\n"
+            message += "-"*70 + "\n"
+            for field_info in unmatched_fields['unmatched_json']:
+                message += f"  • {field_info['field_name']}\n"
+                message += f"    Status: {field_info['match_type']}\n"
+                if field_info.get('category'):
+                    message += f"    Category: {field_info['category']}\n"
+                message += "\n"
+        
+        # Create a window for displaying results
+        window = tk.Toplevel(self.root)
+        window.title("Evolvus ID - Unmatched Fields")
+        window.geometry("700x500")
+        
+        text_widget = scrolledtext.ScrolledText(window, wrap=tk.WORD, padx=10, pady=10)
+        text_widget.pack(fill=tk.BOTH, expand=True)
+        text_widget.insert(1.0, message)
+        text_widget.config(state=tk.DISABLED)
+        
+        ttk.Button(window, text="Close", command=window.destroy).pack(pady=5)
+    
+    def show_special_characters(self):
+        """Display special characters in a separate window with file names and line numbers"""
+        if not self.fields_with_special_chars['db'] and not self.fields_with_special_chars['json']:
+            messagebox.showinfo("No Special Characters", "No special characters found in field values.")
+            return
+        
+        # Create a new window for displaying special characters
+        window = tk.Toplevel(self.root)
+        window.title("Special Characters Validation Report")
+        window.geometry("900x600")
+        
+        # Create a scrolled text widget
+        text_widget = scrolledtext.ScrolledText(window, wrap=tk.WORD, padx=10, pady=10, font=("Courier", 9))
+        text_widget.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        message = "SPECIAL CHARACTER VALIDATION REPORT\n"
+        message += "=" * 80 + "\n\n"
+        message += "Fields with special characters in VALUES (excluding HELM, MolStructure, SMILES fields):\n\n"
+        
+        if self.fields_with_special_chars['db']:
+            message += "ANNEXURE FIELDS:\n"
+            message += "-" * 80 + "\n"
+            field_to_chars = {}
+            for f in self.fields_with_special_chars['db']:
+                field_name = f['field']
+                special_chars = f.get('special_chars', [])
+                if field_name not in field_to_chars:
+                    field_to_chars[field_name] = set()
+                field_to_chars[field_name].update(special_chars)
+            
+            for field in sorted(field_to_chars.keys()):
+                chars_list = sorted(list(field_to_chars[field]))
+                chars_str = ', '.join([f"'{c}'" for c in chars_list])
+                message += f"  • {field}: special characters [{chars_str}]\n"
+            message += "\n"
+        
+        if self.fields_with_special_chars['json']:
+            message += "JSON FIELDS:\n"
+            message += "-" * 80 + "\n"
+            
+            # Group by field but keep all file/line info
+            # Only include entries that actually have special characters
+            field_to_info = {}
+            for f in self.fields_with_special_chars['json']:
+                field_name = f['field']
+                special_chars = f.get('special_chars', [])
+                
+                # Skip if no special characters found (shouldn't happen, but double-check)
+                if not special_chars or len(special_chars) == 0:
+                    continue
+                
+                sample_value = f.get('sample_value', '')
+                file_path = f.get('file', '')
+                line_number = f.get('line_number')
+                
+                if field_name not in field_to_info:
+                    field_to_info[field_name] = {
+                        'special_chars': set(),
+                        'occurrences': []  # List of (file, line_number, sample_value, special_chars) tuples
+                    }
+                field_to_info[field_name]['special_chars'].update(special_chars)
+                if file_path:
+                    file_name = os.path.basename(file_path)
+                    # Store the special chars for this specific occurrence
+                    field_to_info[field_name]['occurrences'].append((file_name, line_number, sample_value, special_chars))
+            
+            for field in sorted(field_to_info.keys()):
+                info = field_to_info[field]
+                chars_list = sorted(list(info['special_chars']))
+                chars_str = ', '.join([f"'{c}'" for c in chars_list])
+                message += f"\n  • {field}:\n"
+                message += f"      Special characters: [{chars_str}]\n"
+                
+                # Show all occurrences with file names and line numbers
+                # Only show occurrences that actually have special characters
+                for file_name, line_num, sample, occ_chars in info['occurrences']:
+                    # Double-check this occurrence has special characters
+                    if not occ_chars or len(occ_chars) == 0:
+                        continue
+                    
+                    occ_chars_str = ', '.join([f"'{c}'" for c in sorted(occ_chars)])
+                    if line_num:
+                        message += f"      - File: {file_name}, Line: {line_num}\n"
+                    else:
+                        message += f"      - File: {file_name}\n"
+                    message += f"        Special characters in this occurrence: [{occ_chars_str}]\n"
+                    if sample:
+                        sample_display = sample[:100] + '...' if len(sample) > 100 else sample
+                        message += f"        Sample value: \"{sample_display}\"\n"
+        
+        text_widget.insert(1.0, message)
+        text_widget.config(state=tk.DISABLED)
+        
+        # Add close button
+        ttk.Button(window, text="Close", command=window.destroy).pack(pady=5)
+    
+    def export_results(self):
+        """Export comparison results to file"""
+        try:
+            filename = filedialog.asksaveasfilename(
+                title="Export Results",
+                defaultextension=".json",
+                filetypes=[("JSON files", "*.json"), ("Text files", "*.txt"), ("All files", "*.*")]
+            )
+            
+            if filename:
+                results = {
+                    'database_fields': self.db_fields,
+                    'all_database_fields': self.all_db_fields,
+                    'total_database_fields': len(self.all_db_fields),
+                    'json_fields': self.json_fields,
+                    'comparison_summary': self.get_comparison_summary()
+                }
+                
+                with open(filename, 'w') as f:
+                    json.dump(results, f, indent=2)
+                
+                messagebox.showinfo("Success", f"Results exported to {filename}")
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to export results: {str(e)}")
+    
+    def export_unmatched_json_fields(self):
+        """Export unmatched JSON fields to a separate file"""
+        try:
+            unmatched_fields = self.get_unmatched_fields()
+            unmatched_json_fields = unmatched_fields.get('unmatched_json', [])
+            
+            if not unmatched_json_fields:
+                messagebox.showinfo("No Fields Found", "No fields not found under annexure to export.")
+                return
+            
+            filename = filedialog.asksaveasfilename(
+                title="Export Fields Not Found Under Annexure",
+                defaultextension=".json",
+                filetypes=[("JSON files", "*.json"), ("Text files", "*.txt"), ("All files", "*.*")]
+            )
+            
+            if filename:
+                # Collect all unique unmatched JSON field names
+                unique_fields = list(set([field['field_name'] for field in unmatched_json_fields]))
+                unique_fields.sort()
+                
+                # Also collect from per-record unmatched info
+                for json_file, record_info in self.record_unmatched_info.items():
+                    for record_idx, info in record_info.items():
+                        if info.get('unmatched_json'):
+                            for field_name in info['unmatched_json']:
+                                if field_name not in unique_fields:
+                                    unique_fields.append(field_name)
+                
+                unique_fields.sort()
+                
+                # Prepare export data
+                export_data = {
+                    'total_unmatched_json_fields': len(unique_fields),
+                    'unmatched_fields': unique_fields,
+                    'detailed_info': unmatched_json_fields,
+                    'export_timestamp': str(datetime.now()),
+                    'files_analyzed': [os.path.basename(f) for f in self.json_fields.keys()]
+                }
+                
+                # Write to file
+                if filename.endswith('.txt'):
+                    # Text format
+                    with open(filename, 'w', encoding='utf-8') as f:
+                        f.write("FIELDS NOT FOUND UNDER ANNEXURE\n")
+                        f.write("=" * 50 + "\n\n")
+                        f.write(f"Total Fields Not Found: {len(unique_fields)}\n")
+                        f.write(f"Export Date: {export_data['export_timestamp']}\n\n")
+                        f.write("Fields (in JSON but not found under annexure):\n")
+                        f.write("-" * 50 + "\n")
+                        for field in unique_fields:
+                            f.write(f"  - {field}\n")
+                        f.write("\n\nDetailed Information:\n")
+                        f.write("-" * 50 + "\n")
+                        for field_info in unmatched_json_fields:
+                            f.write(f"  - {field_info['field_name']}: {field_info.get('match_type', 'not_found')}\n")
+                else:
+                    # JSON format
+                    with open(filename, 'w', encoding='utf-8') as f:
+                        json.dump(export_data, f, indent=2, ensure_ascii=False)
+                
+                messagebox.showinfo("Success", 
+                    f"Fields not found under annexure exported to:\n{filename}\n\n"
+                    f"Total fields: {len(unique_fields)}")
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to export fields not found under annexure: {str(e)}")
+    
+    def get_comparison_summary(self):
+        """Get comparison summary data"""
+        summary = {
+            'matched': 0,
+            'unmatched_db': 0,
+            'unmatched_json': 0
+        }
+        
+        for item in self.results_tree.get_children():
+            values = self.results_tree.item(item, 'values')
+            status = values[0]
+            if status == 'matched':
+                summary['matched'] += 1
+            elif status == 'unmatched_db':
+                summary['unmatched_db'] += 1
+            else:
+                summary['unmatched_json'] += 1
+        
+        return summary
+    
+    def get_unmatched_fields(self):
+        """Get list of all unmatched fields categorized by type (excluding null array fields)"""
+        # Use dictionaries to track unique fields (deduplicate by field_name)
+        unmatched_db_dict = {}      # {field_name: match_type}
+        unmatched_json_dict = {}    # {field_name: match_type}
+        category_null_dict = {}     # {field_name: match_type}
+        
+        for item in self.results_tree.get_children():
+            field_name = self.results_tree.item(item, 'text')
+            values = self.results_tree.item(item, 'values')
+            display_status = values[0]
+            match_type = values[3] if len(values) > 3 else ''
+            
+            # Convert display status back to internal status
+            if display_status == 'not found under annexure':
+                status = 'unmatched_json'
+            elif display_status == 'missing in JSON':
+                status = 'unmatched_db'
+            else:
+                status = display_status
+            
+            if status == 'unmatched_db':
+                if 'category_null' in match_type:
+                    # Store for reference but don't count as unmatched
+                    if field_name not in category_null_dict:
+                        category_null_dict[field_name] = match_type
+                else:
+                    # Only store once per field name (deduplicate)
+                    if field_name not in unmatched_db_dict:
+                        unmatched_db_dict[field_name] = match_type
+            elif status == 'unmatched_json':
+                # Only store once per field name (deduplicate)
+                if field_name not in unmatched_json_dict:
+                    unmatched_json_dict[field_name] = match_type
+        
+        # Convert dictionaries to lists
+        unmatched_fields = {
+            'unmatched_db': [{'field_name': name, 'match_type': match_type} 
+                            for name, match_type in unmatched_db_dict.items()],
+            'unmatched_json': [{'field_name': name, 'match_type': match_type} 
+                              for name, match_type in unmatched_json_dict.items()],
+            'category_null': [{'field_name': name, 'match_type': match_type} 
+                             for name, match_type in category_null_dict.items()]
+        }
+        
+        return unmatched_fields
+    
+    def get_unmatched_fields_for_evolvus_id(self):
+        """Get list of unmatched fields specifically for evolvus_id (excluding null array fields)"""
+        unmatched_fields = {
+            'unmatched_db': [],
+            'unmatched_json': []
+        }
+        
+        # Get field category mapping to identify fields under evolvus_id
+        database = self.database_var.get()
+        field_category_mapping = {}
+        if database:
+            field_category_mapping = self.field_loader.get_field_category_mapping(database)
+        
+        # Normalize evolvus_id for comparison
+        evolvus_id_normalized = 'evolvusid'.replace(' ', '').replace('_', '').replace('-', '').lower()
+        
+        for item in self.results_tree.get_children():
+            field_name = self.results_tree.item(item, 'text')
+            values = self.results_tree.item(item, 'values')
+            status = values[0]
+            match_type = values[3] if len(values) > 3 else ''
+            
+            # Skip fields with null categories
+            if 'category_null' in match_type:
+                continue
+            
+            # Check if field belongs to evolvus_id category
+            category = field_category_mapping.get(field_name, '')
+            if category:
+                normalized_cat = category.replace(' ', '').replace('_', '').replace('-', '').lower()
+                if normalized_cat == evolvus_id_normalized:
+                    if status == 'unmatched_db':
+                        unmatched_fields['unmatched_db'].append({
+                            'field_name': field_name,
+                            'match_type': match_type,
+                            'category': category
+                        })
+                    elif status == 'unmatched_json':
+                        unmatched_fields['unmatched_json'].append({
+                            'field_name': field_name,
+                            'match_type': match_type,
+                            'category': category
+                        })
+            # Also check if field name itself contains evolvus_id pattern
+            elif 'evolvus' in field_name.lower():
+                if status == 'unmatched_db':
+                    unmatched_fields['unmatched_db'].append({
+                        'field_name': field_name,
+                        'match_type': match_type,
+                        'category': 'evolvus_id'
+                    })
+                elif status == 'unmatched_json':
+                    unmatched_fields['unmatched_json'].append({
+                        'field_name': field_name,
+                        'match_type': match_type,
+                        'category': 'evolvus_id'
+                    })
+        
+        return unmatched_fields
+    
+    def clear_all(self):
+        """Clear all data and results (but keep database fields loaded)"""
+        self.json_fields = {}
+        self.comparison_results = {}
+        self.json_folder = None
+        self.json_files_list = []
+        self.json_folder_var.set("")  # Clear folder display
+        self.record_unmatched_info = {}  # Clear per-record unmatched info
+        self.fields_with_special_chars = {'db': [], 'json': []}  # Clear special character validation results
+        
+        for item in self.results_tree.get_children():
+            self.results_tree.delete(item)
+        
+        self.summary_text.delete(1.0, tk.END)
+        
+        # Clear processing status
+        self.progress_status_var.set("Ready")
+        self.progress_bar['value'] = 0
+        self.progress_bar.grid_remove()  # Hide progress bar
+        self.is_processing = False
+        
+        messagebox.showinfo("Cleared", "JSON fields and comparison results cleared.\nAnnexure fields remain loaded.")
+
+
+def main():
+    root = tk.Tk()
+    app = FieldMapperApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
+
