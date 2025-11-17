@@ -11,11 +11,314 @@ import sys
 import glob
 import logging
 import threading
+import subprocess
+import platform
 from typing import Dict, List, Set, Tuple
 from datetime import datetime
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
+# Setup logging with file handler
+def setup_logging(database_name: str = ""):
+    """Setup logging - only creates special characters and field matching log files"""
+    # Create logs directory if it doesn't exist
+    logs_dir = "logs"
+    if not os.path.exists(logs_dir):
+        os.makedirs(logs_dir)
+    
+    # Create log filenames with database name and timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Sanitize database name for filename (remove invalid characters)
+    safe_db_name = database_name.replace(' ', '_').replace('/', '_').replace('\\', '_').replace(':', '_').replace('(', '_').replace(')', '_') if database_name else "default"
+    
+    # Get absolute path for logs directory
+    logs_dir_abs = os.path.abspath(logs_dir)
+    
+    # Final logs (complete summary at the end)
+    log_filename_special_chars_final = os.path.join(logs_dir_abs, f"{safe_db_name}_special_chars_{timestamp}.log")
+    log_filename_field_matching_final = os.path.join(logs_dir_abs, f"{safe_db_name}_field_matching_{timestamp}.log")
+    
+    # Error log file
+    log_filename_errors = os.path.join(logs_dir_abs, f"{safe_db_name}_errors_{timestamp}.log")
+    
+    # Log the log file locations
+    logger.info(f"Log files will be saved to: {logs_dir_abs}")
+    logger.info(f"  - Special chars: {log_filename_special_chars_final}")
+    logger.info(f"  - Field matching: {log_filename_field_matching_final}")
+    logger.info(f"  - Errors: {log_filename_errors}")
+    
+    # Special characters log - write final summary only
+    class SpecialCharsFileWriter:
+        """Write special characters logs - final summary only"""
+        def __init__(self, final_filename):
+            self.final_filename = final_filename
+            # Data for final summary log
+            self.db_fields = {}
+            self.json_fields = {}
+        
+        def write_json_field(self, field_name, special_chars, file_name, line_num, sample_value):
+            """Store JSON field data for final summary log"""
+            # Store for final summary
+            if field_name not in self.json_fields:
+                self.json_fields[field_name] = {
+                    'special_chars': set(),
+                    'sample_value': sample_value,
+                    'files': []
+                }
+            self.json_fields[field_name]['special_chars'].update(special_chars)
+            if not self.json_fields[field_name]['sample_value']:
+                self.json_fields[field_name]['sample_value'] = sample_value
+            if file_name:
+                self.json_fields[field_name]['files'].append((file_name, line_num))
+        
+        def write_db_field(self, field_name, special_chars):
+            """Store DB field data for final summary log"""
+            # Store for final summary
+            if field_name not in self.db_fields:
+                self.db_fields[field_name] = set()
+            self.db_fields[field_name].update(special_chars)
+        
+        def finalize(self):
+            """Write final summary log"""
+            # Write final summary log
+            final_file = open(self.final_filename, 'w', encoding='utf-8')
+            final_file.write("SPECIAL CHARACTER VALIDATION\n")
+            final_file.write("="*50 + "\n")
+            final_file.write("Fields with special characters in VALUES (excluding HELM, MolStructure, SMILES fields):\n\n")
+            
+            if self.db_fields:
+                unique_db_fields = sorted(self.db_fields.keys())
+                final_file.write(f"Annexure Fields ({len(unique_db_fields)}):\n")
+                for field in unique_db_fields:
+                    chars_list = sorted(list(self.db_fields[field]))
+                    chars_str = ', '.join([f"'{c}'" for c in chars_list])
+                    final_file.write(f"  - {field}: special characters [{chars_str}]\n")
+            
+            if self.json_fields:
+                unique_json_fields = sorted(self.json_fields.keys())
+                final_file.write(f"\nJSON Fields ({len(unique_json_fields)}):\n")
+                for field in unique_json_fields:
+                    info = self.json_fields[field]
+                    chars_list = sorted(list(info['special_chars']))
+                    chars_str = ', '.join([f"'{c}'" for c in chars_list])
+                    sample = info['sample_value']
+                    
+                    file_info_parts = []
+                    for file_name, line_num in info['files']:
+                        if line_num:
+                            file_info_parts.append(f"{file_name}:{line_num}")
+                        else:
+                            file_info_parts.append(file_name)
+                    file_info = ", ".join(file_info_parts) if file_info_parts else ""
+                    
+                    if sample:
+                        sample_display = sample[:80] + '...' if len(sample) > 80 else sample
+                        if file_info:
+                            final_file.write(f"  - {field}: special characters [{chars_str}], file: {file_info}, sample value: \"{sample_display}\"\n")
+                        else:
+                            final_file.write(f"  - {field}: special characters [{chars_str}], sample value: \"{sample_display}\"\n")
+                    else:
+                        if file_info:
+                            final_file.write(f"  - {field}: special characters [{chars_str}], file: {file_info}\n")
+                        else:
+                            final_file.write(f"  - {field}: special characters [{chars_str}]\n")
+            
+            if not self.db_fields and not self.json_fields:
+                final_file.write("No special characters found in field values.\n\n")
+            
+            final_file.close()
+    
+    # Error log writer - writes all errors to a separate file
+    class ErrorLogWriter:
+        """Write errors to a separate error log file"""
+        def __init__(self, error_filename):
+            self.error_filename = error_filename
+            try:
+                # Ensure directory exists
+                os.makedirs(os.path.dirname(error_filename), exist_ok=True)
+                self.error_file = open(error_filename, 'w', encoding='utf-8')
+                self.error_file.write("ERROR LOG\n")
+                self.error_file.write("="*50 + "\n")
+                self.error_file.write(f"Database: {database_name}\n")
+                self.error_file.write(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                self.error_file.write("="*50 + "\n\n")
+                self.error_file.flush()
+                logger.info(f"Created error log: {error_filename}")
+            except Exception as e:
+                logger.error(f"Failed to create error log file {error_filename}: {e}", exc_info=True)
+                self.error_file = None
+        
+        def write_error(self, error_message, exc_info=None, file_path=None, line_number=None):
+            """Write an error to the error log file"""
+            if self.error_file is None:
+                return
+            
+            try:
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                self.error_file.write(f"[{timestamp}] ERROR\n")
+                
+                if file_path:
+                    if line_number:
+                        self.error_file.write(f"Location: {file_path}:{line_number}\n")
+                    else:
+                        self.error_file.write(f"Location: {file_path}\n")
+                
+                self.error_file.write(f"Message: {error_message}\n")
+                
+                if exc_info:
+                    import traceback
+                    if isinstance(exc_info, Exception):
+                        self.error_file.write(f"Exception: {type(exc_info).__name__}: {str(exc_info)}\n")
+                        self.error_file.write("Traceback:\n")
+                        self.error_file.write(''.join(traceback.format_exception(type(exc_info), exc_info, exc_info.__traceback__)))
+                    elif exc_info is True:
+                        # Get current exception
+                        import sys
+                        exc_type, exc_value, exc_traceback = sys.exc_info()
+                        if exc_type:
+                            self.error_file.write(f"Exception: {exc_type.__name__}: {str(exc_value)}\n")
+                            self.error_file.write("Traceback:\n")
+                            self.error_file.write(''.join(traceback.format_exception(exc_type, exc_value, exc_traceback)))
+                
+                self.error_file.write("-"*50 + "\n\n")
+                self.error_file.flush()
+            except Exception as e:
+                # Don't log errors about error logging to avoid recursion
+                print(f"Failed to write to error log: {e}")
+        
+        def write_warning(self, warning_message, file_path=None):
+            """Write a warning to the error log file"""
+            if self.error_file is None:
+                return
+            
+            try:
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                self.error_file.write(f"[{timestamp}] WARNING\n")
+                
+                if file_path:
+                    self.error_file.write(f"Location: {file_path}\n")
+                
+                self.error_file.write(f"Message: {warning_message}\n")
+                self.error_file.write("-"*50 + "\n\n")
+                self.error_file.flush()
+            except Exception as e:
+                print(f"Failed to write warning to error log: {e}")
+        
+        def close(self):
+            """Close the error log file"""
+            if self.error_file:
+                try:
+                    self.error_file.write(f"\nError log closed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    self.error_file.close()
+                except:
+                    pass
+    
+    # Create error log writer instance
+    error_log_writer = ErrorLogWriter(log_filename_errors)
+    
+    # Create special chars writer instance (will be stored globally)
+    special_chars_writer = SpecialCharsFileWriter(log_filename_special_chars_final)
+    
+    # Field matching log - write final summary only
+    class FieldMatchingFileWriter:
+        """Write field matching logs - final summary only"""
+        def __init__(self, final_filename):
+            self.final_filename = final_filename
+            # Data for final summary log
+            self.file_results = []
+            self.unmatched_db_fields = []
+            self.unmatched_json_fields = []
+            self.total_matched = 0
+            self.total_unmatched_db = 0
+            self.total_unmatched_json = 0
+        
+        def write_comparison_summary(self, matched, unmatched_db, unmatched_json):
+            """Store totals for final log"""
+            self.total_matched = matched
+            self.total_unmatched_db = unmatched_db
+            self.total_unmatched_json = unmatched_json
+        
+        def write_unmatched_db_field(self, field_name, match_type):
+            """Store unmatched DB field data for final summary log"""
+            # Store for final summary
+            self.unmatched_db_fields.append({'field_name': field_name, 'match_type': match_type})
+        
+        def write_unmatched_json_field(self, field_name, match_type):
+            """Store unmatched JSON field data for final summary log"""
+            # Store for final summary
+            self.unmatched_json_fields.append({'field_name': field_name, 'match_type': match_type})
+        
+        def write_file_result(self, file_name, matched, unmatched_db, unmatched_json):
+            """Store per-file result data for final summary log"""
+            # Store for final summary
+            self.file_results.append((file_name, matched, unmatched_db, unmatched_json))
+        
+        def finalize(self):
+            """Write final summary log"""
+            # Write final summary log
+            final_file = open(self.final_filename, 'w', encoding='utf-8')
+            final_file.write("FIELD COMPARISON SUMMARY\n")
+            final_file.write("="*50 + "\n\n")
+            final_file.write("COMPARISON RESULTS:\n")
+            final_file.write("-"*50 + "\n")
+            final_file.write(f"Matched Fields: {self.total_matched}\n")
+            final_file.write(f"Missing in JSON: {self.total_unmatched_db}\n")
+            final_file.write(f"Not found under annexure: {self.total_unmatched_json}\n")
+            final_file.write(f"Total Compared: {self.total_matched + self.total_unmatched_db + self.total_unmatched_json}\n\n")
+            
+            if self.file_results:
+                final_file.write("PER-FILE RESULTS:\n")
+                final_file.write("-"*50 + "\n")
+                for file_name, matched, unmatched_db, unmatched_json in self.file_results:
+                    final_file.write(f"File: {file_name}\n")
+                    final_file.write(f"  Matched: {matched}, Missing in JSON: {unmatched_db}, Not in Annexure: {unmatched_json}\n")
+                final_file.write("\n")
+            
+            if self.unmatched_db_fields or self.unmatched_json_fields:
+                final_file.write("UNMATCHED FIELDS DETAILS:\n")
+                final_file.write("-"*50 + "\n")
+                
+                if self.unmatched_db_fields:
+                    unique_db = {}
+                    for field_info in self.unmatched_db_fields:
+                        field_name = field_info['field_name']
+                        if field_name not in unique_db:
+                            unique_db[field_name] = field_info['match_type']
+                    
+                    final_file.write(f"\nMissing in JSON Fields ({len(unique_db)}):\n")
+                    for field_name, match_type in sorted(unique_db.items()):
+                        final_file.write(f"  - {field_name}: {match_type}\n")
+                
+                if self.unmatched_json_fields:
+                    unique_json = {}
+                    for field_info in self.unmatched_json_fields:
+                        field_name = field_info['field_name']
+                        if field_name not in unique_json:
+                            unique_json[field_name] = field_info['match_type']
+                    
+                    final_file.write(f"\nFields not found under annexure ({len(unique_json)}):\n")
+                    for field_name, match_type in sorted(unique_json.items()):
+                        final_file.write(f"  - {field_name}: {match_type}\n")
+            
+            final_file.close()
+    
+    # Create field matching writer instance
+    field_matching_writer = FieldMatchingFileWriter(log_filename_field_matching_final)
+    
+    return {
+        'special_chars': log_filename_special_chars_final,
+        'field_matching': log_filename_field_matching_final,
+        'errors': log_filename_errors,
+        'special_chars_writer': special_chars_writer,
+        'field_matching_writer': field_matching_writer,
+        'error_log_writer': error_log_writer
+    }
+
+# Initialize basic logging (without file handlers, will be set up when comparison starts)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[logging.StreamHandler()]  # Only console for now
+    )
 logger = logging.getLogger(__name__)
 
 # Handle bundled executable (PyInstaller)
@@ -57,6 +360,11 @@ class FieldMapperApp:
         self.loader_data = {}
         self.record_unmatched_info = {}  # Store per-record unmatched field info: {file_path: {record_idx: {unmatched_json: [], unmatched_db: []}}}
         self.fields_with_special_chars = {'db': [], 'json': []}  # Store fields with special characters
+        self.current_log_files = {}  # Store current log file paths (will be set when comparison starts)
+        self.special_chars_writer = None  # Special chars log writer (will be set when comparison starts)
+        self.field_matching_writer = None  # Field matching log writer (will be set when comparison starts)
+        self.error_log_writer = None  # Error log writer (will be set when comparison starts)
+        self.logs_dir = "logs"  # Logs directory
         
         self.create_widgets()
         self.auto_load_config()
@@ -212,6 +520,10 @@ class FieldMapperApp:
         self.show_special_chars_button = ttk.Button(button_frame, text="Show Special Characters", 
                   command=self.show_special_characters)
         self.show_special_chars_button.pack(side=tk.LEFT, padx=5)
+        
+        self.view_logs_button = ttk.Button(button_frame, text="View Logs", 
+                  command=self.show_log_menu)
+        self.view_logs_button.pack(side=tk.LEFT, padx=5)
         
         self.clear_button = ttk.Button(button_frame, text="Clear All", 
                   command=self.clear_all)
@@ -379,6 +691,10 @@ class FieldMapperApp:
             self.export_unmatched_json_button.config(state=state)
         if hasattr(self, 'show_special_chars_button'):
             self.show_special_chars_button.config(state=state)
+        # Log viewing buttons should remain enabled during processing
+        # self.view_logs_button.config(state=state)
+        # self.view_special_chars_logs_button.config(state=state)
+        # self.view_field_matching_logs_button.config(state=state)
         self.clear_button.config(state=state)
         self.database_combo.config(state=state)
         
@@ -406,6 +722,7 @@ class FieldMapperApp:
                 status_msg = f"Processing: {current:,}/{total:,} files ({percentage:.1f}%)"
             else:
                 status_msg = f"Processing: {current}/{total} files ({percentage:.1f}%)"
+            # Only append message if provided (for large datasets, message updates less frequently)
             if message:
                 status_msg += f" - {message}"
             self.progress_status_var.set(status_msg)
@@ -441,6 +758,34 @@ class FieldMapperApp:
             self.fields_with_special_chars = {'db': [], 'json': []}  # Clear special character validation results
             self.comparison_results = {}  # Clear comparison results
             
+            # Setup logging with database name for this comparison
+            database = self.database_var.get()
+            if database:
+                log_files = setup_logging(database)
+                self.current_log_files = log_files
+                self.special_chars_writer = log_files.get('special_chars_writer')
+                self.field_matching_writer = log_files.get('field_matching_writer')
+                self.error_log_writer = log_files.get('error_log_writer')
+                # Pass error_log_writer to the writer classes so they can log errors
+                if self.special_chars_writer:
+                    self.special_chars_writer.error_log_writer = self.error_log_writer
+                if self.field_matching_writer:
+                    self.field_matching_writer.error_log_writer = self.error_log_writer
+                logger.info(f"Logging initialized for database '{database}'. Log files:")
+                logger.info(f"  - Special characters: {log_files['special_chars']}")
+                logger.info(f"  - Field matching: {log_files['field_matching']}")
+                logger.info(f"  - Errors: {log_files['errors']}")
+                
+                # Set database-specific excluded keywords for special character validation
+                try:
+                    import database_config
+                    if hasattr(database_config, 'EXCLUDED_KEYWORDS') and database in database_config.EXCLUDED_KEYWORDS:
+                        excluded_keywords = database_config.EXCLUDED_KEYWORDS[database]
+                        self.comparator.set_database_excluded_keywords(database, excluded_keywords)
+                        logger.info(f"Set excluded keywords for '{database}': {excluded_keywords}")
+                except Exception as e:
+                    logger.warning(f"Could not load excluded keywords for database '{database}': {e}")
+            
             # Set processing state
             self.set_processing_state(True)
             
@@ -468,6 +813,8 @@ class FieldMapperApp:
             self.set_processing_state(False)
             messagebox.showerror("Error", f"Failed to start comparison: {str(e)}")
             logger.error(f"Comparison start error: {str(e)}", exc_info=True)
+            if self.error_log_writer:
+                self.error_log_writer.write_error(f"Failed to start comparison: {str(e)}", exc_info=True)
     
     def _process_comparison_batch(self, json_files_to_process: List[str]):
         """Process comparison in background thread with proper batch processing"""
@@ -485,7 +832,7 @@ class FieldMapperApp:
             # For very large datasets (200k+ files), process one at a time to minimize memory
             if total_files > 50000:
                 batch_size = 1
-                progress_update_interval = 1000  # Update progress every 1000 files
+                progress_update_interval = 5000  # Update progress every 5000 files (reduced UI updates for better performance)
             elif total_files > 10000:
                 batch_size = 1
                 progress_update_interval = 100  # Update progress every 100 files
@@ -500,6 +847,12 @@ class FieldMapperApp:
             if total_files > 1000:
                 from collections import defaultdict
                 field_stats = defaultdict(lambda: {'matched': 0, 'unmatched_db': 0, 'unmatched_json': 0, 'category_null': 0})
+                # Track fields that exist in JSON (even if not matched) to avoid false "missing in JSON" reports
+                fields_exist_in_json = set()  # Set of field names that exist in at least one JSON file
+                # Track array fields and which files are missing them
+                array_fields_missing_files = defaultdict(list)  # {field_name: [list of file names where missing]}
+                # Identify which fields are array fields (from field_category_mapping)
+                array_field_names = set(field_category_mapping.keys()) if field_category_mapping else set()
                 file_stats = {'success': 0, 'failed': 0}
                 
                 # Process files in batches
@@ -508,22 +861,58 @@ class FieldMapperApp:
                     
                     for json_file in batch:
                         try:
-                            # Load fields on-the-fly
+                            # PERFORMANCE OPTIMIZATION: Load JSON once and reuse for all operations
+                            json_path = self.json_path_var.get()
+                            
+                            # Load JSON data once (cached for subsequent operations)
+                            json_data = self.json_parser.load_json(json_file)
+                            if json_data is None:
+                                file_stats['failed'] += 1
+                                processed += 1
+                                continue
+                            
+                            # Navigate to json_path if specified (do this once)
+                            if json_path:
+                                try:
+                                    json_data = self.json_parser._navigate_path(json_data, json_path)
+                                    if json_data is None:
+                                        file_stats['failed'] += 1
+                                        processed += 1
+                                        continue
+                                except Exception:
+                                    file_stats['failed'] += 1
+                                    processed += 1
+                                    continue
+                            
+                            # Extract fields from already-loaded data (avoid re-reading file)
                             if json_file in self.json_fields:
                                 json_fields = self.json_fields[json_file]
                             else:
-                                json_path = self.json_path_var.get()
-                                json_fields = self.json_parser.extract_fields(json_file, json_path)
+                                json_fields = sorted(list(set(self.json_parser._extract_all_fields(json_data))))
                                 self.json_fields[json_file] = json_fields
                             
-                            # Check for null categories in JSON
-                            null_categories = self.json_parser.check_null_categories(json_file, json_path)
+                            # Check null categories from already-loaded data
+                            null_categories = {}
+                            if isinstance(json_data, dict):
+                                for key, value in json_data.items():
+                                    null_categories[key] = (value is None) or (isinstance(value, list) and len(value) == 0)
+                            elif isinstance(json_data, list) and len(json_data) > 0 and isinstance(json_data[0], dict):
+                                for key, value in json_data[0].items():
+                                    null_categories[key] = (value is None) or (isinstance(value, list) and len(value) == 0)
                             
-                            # Get array field mapping (which fields are in arrays)
-                            array_field_mapping = self.json_parser.get_array_field_mapping(json_file, json_path)
+                            # Get array field mapping from already-loaded data
+                            array_field_mapping = self.json_parser._extract_array_fields_recursive(json_data)
                             
-                            # Load JSON data for value validation
-                            json_data = self.json_parser.load_json(json_file)
+                            # Clean special characters from JSON data if configured for this database
+                            if json_data and database:
+                                cleaned_data, chars_removed = self.json_parser.clean_special_characters(json_data, database)
+                                if chars_removed > 0:
+                                    # Save cleaned JSON to cleaned_json folder
+                                    cleaned_path = self.json_parser.save_cleaned_json(json_file, cleaned_data)
+                                    if cleaned_path:
+                                        logger.info(f"Removed {chars_removed} special character(s) from {os.path.basename(json_file)}. Cleaned file saved to: {cleaned_path}")
+                                    # Use cleaned data for comparison
+                                    json_data = cleaned_data
                             
                             results = self.comparator.compare(
                                 self.all_db_fields, 
@@ -533,14 +922,79 @@ class FieldMapperApp:
                                 field_category_mapping=field_category_mapping,
                                 null_categories=null_categories,
                                 array_field_mapping=array_field_mapping,
-                                json_data=json_data
+                                json_data=json_data,
+                                database_name=database
                             )
                             
                             # Collect validation results
                             validation_results = self.comparator.get_validation_results()
                             self.fields_with_special_chars['db'].extend(validation_results['db'])
                             self.fields_with_special_chars['json'].extend(validation_results['json'])
+                            
+                            # Write special character validation results to log file in summary format
+                            if validation_results['json']:
+                                for field_info in validation_results['json']:
+                                    special_chars = field_info.get('special_chars', [])
+                                    file_name = os.path.basename(json_file)
+                                    line_num = field_info.get('line_number')
+                                    sample_value = field_info.get('sample_value', '')
+                                    if self.special_chars_writer:
+                                        self.special_chars_writer.write_json_field(
+                                            field_info['field'], special_chars, file_name, line_num, sample_value
+                                        )
+                            
+                            if validation_results['db']:
+                                for field_info in validation_results['db']:
+                                    special_chars = field_info.get('special_chars', [])
+                                    if self.special_chars_writer:
+                                        self.special_chars_writer.write_db_field(
+                                            field_info['field'], special_chars
+                                        )
+                            
                             self.comparator.clear_validation_results()
+                            
+                            # Write field matching results to log file in summary format
+                            matched_count = sum(1 for r in results if r.get('status') == 'matched')
+                            unmatched_db_count = sum(1 for r in results if r.get('status') == 'unmatched_db' and 'category_null' not in r.get('match_type', ''))
+                            unmatched_json_count = sum(1 for r in results if r.get('status') == 'unmatched_json')
+                            
+                            # Diagnostic: Log if zero matches but fields were extracted
+                            if matched_count == 0 and len(json_fields) > 0:
+                                logger.warning(f"⚠️ {os.path.basename(json_file)}: {len(json_fields)} fields extracted but 0 matches")
+                                logger.warning(f"   Sample JSON fields: {json_fields[:5]}")
+                                logger.warning(f"   Sample annexure fields: {self.all_db_fields[:5] if len(self.all_db_fields) > 0 else 'None'}")
+                            
+                            if self.field_matching_writer:
+                                self.field_matching_writer.write_file_result(
+                                    os.path.basename(json_file), matched_count, unmatched_db_count, unmatched_json_count
+                                )
+                            
+                            # Collect unmatched fields for log file
+                            if unmatched_json_count > 0:
+                                for r in results:
+                                    if r.get('status') == 'unmatched_json':
+                                        if self.field_matching_writer:
+                                            self.field_matching_writer.write_unmatched_json_field(
+                                                r.get('field_name', ''), r.get('match_type', 'not_found')
+                                            )
+                            
+                            if unmatched_db_count > 0:
+                                for r in results:
+                                    if r.get('status') == 'unmatched_db' and 'category_null' not in r.get('match_type', ''):
+                                        if self.field_matching_writer:
+                                            self.field_matching_writer.write_unmatched_db_field(
+                                                r.get('field_name', ''), r.get('match_type', 'not_found')
+                                            )
+                            
+                            # Track all fields that exist in this JSON file (matched or unmatched_json)
+                            # This helps identify fields that exist in some files but are missing in others
+                            for result in results:
+                                field_name = result.get('field_name', '')
+                                status = result.get('status', '')
+                                
+                                # If field is matched or unmatched_json, it exists in JSON
+                                if status in ['matched', 'unmatched_json']:
+                                    fields_exist_in_json.add(field_name)
                             
                             # Aggregate results immediately
                             for result in results:
@@ -553,6 +1007,9 @@ class FieldMapperApp:
                                 elif status == 'unmatched_db':
                                     if match_type != 'category_null':
                                         field_stats[field_name]['unmatched_db'] += 1
+                                        # Track missing files for array fields
+                                        if field_name in array_field_names:
+                                            array_fields_missing_files[field_name].append(os.path.basename(json_file))
                                 elif status == 'unmatched_json':
                                     field_stats[field_name]['unmatched_json'] += 1
                             
@@ -587,6 +1044,7 @@ class FieldMapperApp:
                                                 record_null_categories[key] = False
                                     
                                     # Get array field mapping for this record
+                                    # First, get mapping from JSON (fields that actually exist in non-empty arrays)
                                     record_array_mapping = {}
                                     if isinstance(record, dict):
                                         for key, value in record.items():
@@ -597,6 +1055,23 @@ class FieldMapperApp:
                                                             normalized_field = field_name.replace(' ', '').replace('_', '').replace('-', '').replace('.', '').lower()
                                                             record_array_mapping[normalized_field] = key
                                     
+                                    # Also add database field-to-array mappings for fields that belong to arrays
+                                    # This ensures fields from null/empty arrays in JSON can still be matched
+                                    # Normalize database field names and map them to their arrays
+                                    for db_field, array_name in field_category_mapping.items():
+                                        # Normalize the database field name for comparison
+                                        normalized_db_field = db_field.replace(' ', '').replace('_', '').replace('-', '').replace('.', '').lower()
+                                        # Only add if not already in record_array_mapping (JSON mapping takes precedence)
+                                        if normalized_db_field not in record_array_mapping:
+                                            # Normalize array name to match JSON array names
+                                            normalized_array = array_name.replace(' ', '').replace('_', '').replace('-', '').replace('.', '').lower()
+                                            # Check if this array exists in the record (even if null/empty)
+                                            if isinstance(record, dict) and any(
+                                                key.replace(' ', '').replace('_', '').replace('-', '').replace('.', '').lower() == normalized_array 
+                                                for key in record.keys()
+                                            ):
+                                                record_array_mapping[normalized_db_field] = array_name
+                                    
                                     # Compare this record's fields
                                     record_results = self.comparator.compare(
                                         self.all_db_fields,
@@ -606,7 +1081,8 @@ class FieldMapperApp:
                                         field_category_mapping=field_category_mapping,
                                         null_categories=record_null_categories,
                                         array_field_mapping=record_array_mapping,
-                                        json_data=record
+                                        json_data=record,
+                                        database_name=database
                                     )
                                     
                                     # Find unmatched fields for this record
@@ -649,18 +1125,29 @@ class FieldMapperApp:
                             file_stats['success'] += 1
                             processed += 1
                             
-                            # Update progress at intervals (throttled for large datasets)
-                            if processed % progress_update_interval == 0 or processed == total_files:
-                                # For very large datasets, show percentage only
-                                if total_files > 50000:
-                                    self.update_progress(processed, total_files, f"Processed {processed:,} files")
+                            # Update progress for each file (continuous feedback)
+                            # For very large datasets, update message less frequently but always update counter
+                            if total_files > 50000:
+                                # Update counter every file, but message every interval
+                                if processed % progress_update_interval == 0 or processed == total_files:
+                                    message = f"Processed {processed:,} files"
+                                    if file_stats['failed'] > 0:
+                                        message += f" - Errors: {file_stats['failed']}"
+                                    self.update_progress(processed, total_files, message)
                                 else:
-                                    self.update_progress(processed, total_files, f"Processing: {os.path.basename(json_file)}")
+                                    # Update counter only (no message change) to show continuous progress
+                                    self.update_progress(processed, total_files, "")
+                            else:
+                                # For smaller datasets, show file name for each file
+                                message = f"Processing: {os.path.basename(json_file)}"
+                                if file_stats['failed'] > 0:
+                                    message += f" - Errors: {file_stats['failed']}"
+                                self.update_progress(processed, total_files, message)
                             
                             # Log progress periodically
                             if processed % 1000 == 0:
                                 percentage = (processed * 100) // total_files
-                                logger.info(f"Processed {processed:,}/{total_files:,} files... ({percentage}%)")
+                                logger.info(f"Processed {processed:,}/{total_files:,} files... ({percentage}%) - Success: {file_stats['success']}, Failed: {file_stats['failed']}")
                                 import gc
                                 gc.collect()
                             elif processed % 100 == 0 and total_files <= 10000:
@@ -673,8 +1160,10 @@ class FieldMapperApp:
                             processed += 1
                             # Only log errors periodically for very large datasets
                             if total_files <= 10000 or processed % 1000 == 0:
-                                logger.error(f"Failed to process {json_file}: {str(e)}")
-                            # Update progress at intervals
+                                logger.error(f"Failed to process {json_file}: {str(e)}", exc_info=True)
+                                if self.error_log_writer:
+                                    self.error_log_writer.write_error(f"Failed to process {json_file}: {str(e)}", exc_info=True, file_path=json_file)
+                            # Update progress at intervals - always show error count when there are errors
                             if processed % progress_update_interval == 0:
                                 self.update_progress(processed, total_files, f"Errors: {file_stats['failed']}")
                             continue
@@ -697,10 +1186,32 @@ class FieldMapperApp:
                 logger.info(f"Completed processing {processed} JSON files")
                 self.update_progress(total_files, total_files, "Aggregating results...")
                 
+                # Calculate totals for field matching log
+                total_matched = sum(s['matched'] for s in field_stats.values())
+                total_unmatched_db = sum(s['unmatched_db'] for s in field_stats.values())
+                total_unmatched_json = sum(s['unmatched_json'] for s in field_stats.values())
+                
+                # Write comparison summary to field matching log
+                if self.field_matching_writer:
+                    self.field_matching_writer.write_comparison_summary(total_matched, total_unmatched_db, total_unmatched_json)
+                    self.field_matching_writer.finalize()
+                
+                # Finalize special characters log
+                if self.special_chars_writer:
+                    self.special_chars_writer.finalize()
+                
+                # Close error log
+                if self.error_log_writer:
+                    self.error_log_writer.close()
+                
                 # Convert aggregated stats to results format
+                # IMPORTANT: If a field exists in JSON in ANY file (matched or unmatched_json),
+                # it should NOT be reported as "missing in JSON" (unmatched_db),
+                # even if it's missing in other files (e.g., where parent array is null)
                 all_results = []
                 for field_name, stats in field_stats.items():
                     if stats['matched'] > 0:
+                        # Field exists and matches in at least one file - mark as matched
                         all_results.append({
                             'field_name': field_name,
                             'status': 'matched',
@@ -709,13 +1220,34 @@ class FieldMapperApp:
                             'json_field': field_name
                         })
                     elif stats['unmatched_db'] > 0:
-                        all_results.append({
-                            'field_name': field_name,
-                            'status': 'unmatched_db',
-                            'match_type': f"not_found ({stats['unmatched_db']} times)",
-                            'db_field': field_name,
-                            'json_field': ''
-                        })
+                        # For array fields: report if missing in some files (even if exists in others)
+                        # For non-array fields: only report if never found in any file
+                        if field_name in array_field_names:
+                            # Array field: report with file names where it's missing
+                            missing_files = array_fields_missing_files.get(field_name, [])
+                            if missing_files:
+                                # Create a readable list of missing files (limit to first 10 for display)
+                                if len(missing_files) <= 10:
+                                    files_str = ', '.join(missing_files)
+                                else:
+                                    files_str = ', '.join(missing_files[:10]) + f" and {len(missing_files) - 10} more"
+                                all_results.append({
+                                    'field_name': field_name,
+                                    'status': 'unmatched_db',
+                                    'match_type': f"not_found in: {files_str}",
+                                    'db_field': field_name,
+                                    'json_field': ''
+                                })
+                        else:
+                            # Non-array field: only report if it does NOT exist in JSON in any file
+                            if field_name not in fields_exist_in_json:
+                                all_results.append({
+                                    'field_name': field_name,
+                                    'status': 'unmatched_db',
+                                    'match_type': f"not_found ({stats['unmatched_db']} times)",
+                                    'db_field': field_name,
+                                    'json_field': ''
+                                })
                     elif stats['unmatched_json'] > 0:
                         all_results.append({
                             'field_name': field_name,
@@ -737,22 +1269,55 @@ class FieldMapperApp:
                     
                     for json_file in batch:
                         try:
-                            # Load fields on-the-fly
+                            # PERFORMANCE OPTIMIZATION: Load JSON once and reuse for all operations
+                            json_path = self.json_path_var.get()
+                            
+                            # Load JSON data once (cached for subsequent operations)
+                            json_data = self.json_parser.load_json(json_file)
+                            if json_data is None:
+                                processed += 1
+                                continue
+                            
+                            # Navigate to json_path if specified (do this once)
+                            if json_path:
+                                try:
+                                    json_data = self.json_parser._navigate_path(json_data, json_path)
+                                    if json_data is None:
+                                        processed += 1
+                                        continue
+                                except Exception:
+                                    processed += 1
+                                    continue
+                            
+                            # Extract fields from already-loaded data (avoid re-reading file)
                             if json_file in self.json_fields:
                                 json_fields = self.json_fields[json_file]
                             else:
-                                json_path = self.json_path_var.get()
-                                json_fields = self.json_parser.extract_fields(json_file, json_path)
+                                json_fields = sorted(list(set(self.json_parser._extract_all_fields(json_data))))
                                 self.json_fields[json_file] = json_fields
                             
-                            # Check for null categories
-                            null_categories = self.json_parser.check_null_categories(json_file, self.json_path_var.get())
+                            # Check null categories from already-loaded data
+                            null_categories = {}
+                            if isinstance(json_data, dict):
+                                for key, value in json_data.items():
+                                    null_categories[key] = (value is None) or (isinstance(value, list) and len(value) == 0)
+                            elif isinstance(json_data, list) and len(json_data) > 0 and isinstance(json_data[0], dict):
+                                for key, value in json_data[0].items():
+                                    null_categories[key] = (value is None) or (isinstance(value, list) and len(value) == 0)
                             
-                            # Get array field mapping (which fields are in arrays)
-                            array_field_mapping = self.json_parser.get_array_field_mapping(json_file, self.json_path_var.get())
+                            # Get array field mapping from already-loaded data
+                            array_field_mapping = self.json_parser._extract_array_fields_recursive(json_data)
                             
-                            # Load JSON data for value validation
-                            json_data = self.json_parser.load_json(json_file)
+                            # Clean special characters from JSON data if configured for this database
+                            if json_data and database:
+                                cleaned_data, chars_removed = self.json_parser.clean_special_characters(json_data, database)
+                                if chars_removed > 0:
+                                    # Save cleaned JSON to cleaned_json folder
+                                    cleaned_path = self.json_parser.save_cleaned_json(json_file, cleaned_data)
+                                    if cleaned_path:
+                                        logger.info(f"Removed {chars_removed} special character(s) from {os.path.basename(json_file)}. Cleaned file saved to: {cleaned_path}")
+                                    # Use cleaned data for comparison
+                                    json_data = cleaned_data
                             
                             results = self.comparator.compare(
                                 self.all_db_fields, 
@@ -762,7 +1327,8 @@ class FieldMapperApp:
                                 field_category_mapping=field_category_mapping,
                                 null_categories=null_categories,
                                 array_field_mapping=array_field_mapping,
-                                json_data=json_data
+                                json_data=json_data,
+                                database_name=database
                             )
                             all_results.extend(results)
                             
@@ -770,7 +1336,55 @@ class FieldMapperApp:
                             validation_results = self.comparator.get_validation_results()
                             self.fields_with_special_chars['db'].extend(validation_results['db'])
                             self.fields_with_special_chars['json'].extend(validation_results['json'])
+                            
+                            # Write special character validation results to log file in summary format
+                            if validation_results['json']:
+                                for field_info in validation_results['json']:
+                                    special_chars = field_info.get('special_chars', [])
+                                    file_name = os.path.basename(json_file)
+                                    line_num = field_info.get('line_number')
+                                    sample_value = field_info.get('sample_value', '')
+                                    if self.special_chars_writer:
+                                        self.special_chars_writer.write_json_field(
+                                            field_info['field'], special_chars, file_name, line_num, sample_value
+                                        )
+                            
+                            if validation_results['db']:
+                                for field_info in validation_results['db']:
+                                    special_chars = field_info.get('special_chars', [])
+                                    if self.special_chars_writer:
+                                        self.special_chars_writer.write_db_field(
+                                            field_info['field'], special_chars
+                                        )
+                            
                             self.comparator.clear_validation_results()
+                            
+                            # Write field matching results to log file in summary format
+                            file_matched = sum(1 for r in results if r.get('status') == 'matched')
+                            file_unmatched_db = sum(1 for r in results if r.get('status') == 'unmatched_db' and 'category_null' not in r.get('match_type', ''))
+                            file_unmatched_json = sum(1 for r in results if r.get('status') == 'unmatched_json')
+                            
+                            if self.field_matching_writer:
+                                self.field_matching_writer.write_file_result(
+                                    os.path.basename(json_file), file_matched, file_unmatched_db, file_unmatched_json
+                                )
+                            
+                            # Collect unmatched fields for log file
+                            if file_unmatched_json > 0:
+                                for r in results:
+                                    if r.get('status') == 'unmatched_json':
+                                        if self.field_matching_writer:
+                                            self.field_matching_writer.write_unmatched_json_field(
+                                                r.get('field_name', ''), r.get('match_type', 'not_found')
+                                            )
+                            
+                            if file_unmatched_db > 0:
+                                for r in results:
+                                    if r.get('status') == 'unmatched_db' and 'category_null' not in r.get('match_type', ''):
+                                        if self.field_matching_writer:
+                                            self.field_matching_writer.write_unmatched_db_field(
+                                                r.get('field_name', ''), r.get('match_type', 'not_found')
+                                            )
                             
                             # Per-record logging for multi-record files (only log records with unmatched fields)
                             json_path = self.json_path_var.get()
@@ -799,6 +1413,7 @@ class FieldMapperApp:
                                                 record_null_categories[key] = False
                                     
                                     # Get array field mapping for this record
+                                    # First, get mapping from JSON (fields that actually exist in non-empty arrays)
                                     record_array_mapping = {}
                                     if isinstance(record, dict):
                                         for key, value in record.items():
@@ -809,6 +1424,23 @@ class FieldMapperApp:
                                                             normalized_field = field_name.replace(' ', '').replace('_', '').replace('-', '').replace('.', '').lower()
                                                             record_array_mapping[normalized_field] = key
                                     
+                                    # Also add database field-to-array mappings for fields that belong to arrays
+                                    # This ensures fields from null/empty arrays in JSON can still be matched
+                                    # Normalize database field names and map them to their arrays
+                                    for db_field, array_name in field_category_mapping.items():
+                                        # Normalize the database field name for comparison
+                                        normalized_db_field = db_field.replace(' ', '').replace('_', '').replace('-', '').replace('.', '').lower()
+                                        # Only add if not already in record_array_mapping (JSON mapping takes precedence)
+                                        if normalized_db_field not in record_array_mapping:
+                                            # Normalize array name to match JSON array names
+                                            normalized_array = array_name.replace(' ', '').replace('_', '').replace('-', '').replace('.', '').lower()
+                                            # Check if this array exists in the record (even if null/empty)
+                                            if isinstance(record, dict) and any(
+                                                key.replace(' ', '').replace('_', '').replace('-', '').replace('.', '').lower() == normalized_array 
+                                                for key in record.keys()
+                                            ):
+                                                record_array_mapping[normalized_db_field] = array_name
+                                    
                                     # Compare this record's fields
                                     record_results = self.comparator.compare(
                                         self.all_db_fields,
@@ -818,7 +1450,8 @@ class FieldMapperApp:
                                         field_category_mapping=field_category_mapping,
                                         null_categories=record_null_categories,
                                         array_field_mapping=record_array_mapping,
-                                        json_data=record
+                                        json_data=record,
+                                        database_name=database
                                     )
                                     
                                     # Find unmatched fields for this record
@@ -837,12 +1470,18 @@ class FieldMapperApp:
                             
                             processed += 1
                             
-                            # Update progress at intervals
-                            if processed % progress_update_interval == 0 or processed == total_files:
-                                if total_files > 50000:
+                            # Update progress for each file (continuous feedback)
+                            # For very large datasets, update message less frequently but always update counter
+                            if total_files > 50000:
+                                # Update counter every file, but message every interval
+                                if processed % progress_update_interval == 0 or processed == total_files:
                                     self.update_progress(processed, total_files, f"Processed {processed:,} files")
                                 else:
-                                    self.update_progress(processed, total_files, f"Processing: {os.path.basename(json_file)}")
+                                    # Update counter only (no message change) to show continuous progress
+                                    self.update_progress(processed, total_files, "")
+                            else:
+                                # For smaller datasets, show file name for each file
+                                self.update_progress(processed, total_files, f"Processing: {os.path.basename(json_file)}")
                             
                             if processed % 1000 == 0:
                                 logger.info(f"Processed {processed:,}/{total_files:,} files...")
@@ -873,11 +1512,31 @@ class FieldMapperApp:
                 
                 self.update_progress(total_files, total_files, "Processing results...")
                 
+                # Calculate totals for field matching log
+                matched_count = sum(1 for r in all_results if r.get('status') == 'matched')
+                unmatched_db_count = sum(1 for r in all_results if r.get('status') == 'unmatched_db' and 'category_null' not in r.get('match_type', ''))
+                unmatched_json_count = sum(1 for r in all_results if r.get('status') == 'unmatched_json')
+                
+                # Write comparison summary to field matching log
+                if self.field_matching_writer:
+                    self.field_matching_writer.write_comparison_summary(matched_count, unmatched_db_count, unmatched_json_count)
+                    self.field_matching_writer.finalize()
+                
+                # Finalize special characters log
+                if self.special_chars_writer:
+                    self.special_chars_writer.finalize()
+                
+                # Close error log
+                if self.error_log_writer:
+                    self.error_log_writer.close()
+                
                 # Schedule UI update on main thread
                 self.root.after(0, self._display_results_complete, all_results, None, processed)
                 
         except Exception as e:
             logger.error(f"Batch processing error: {str(e)}", exc_info=True)
+            if self.error_log_writer:
+                self.error_log_writer.write_error(f"Batch processing error: {str(e)}", exc_info=True)
             self.root.after(0, self._processing_error, str(e))
     
     def _display_results_complete(self, all_results: List[Dict], file_stats: Dict = None, processed: int = 0):
@@ -893,7 +1552,9 @@ class FieldMapperApp:
                                        f"Total: {processed} files")
             else:
                 # Display individual results (deduplicate by field name)
-                self.update_progress(len(all_results), len(all_results), "Displaying results...")
+                # Use actual file count, not result count
+                total_files = len(self.json_files_list) if hasattr(self, 'json_files_list') and self.json_files_list else processed
+                self.update_progress(processed, total_files, "Displaying results...")
                 matched_count = 0
                 unmatched_db_count = 0
                 unmatched_json_count = 0
@@ -966,6 +1627,8 @@ class FieldMapperApp:
                                   f"Not found under annexure: {unmatched_json_count}")
         except Exception as e:
             logger.error(f"Display results error: {str(e)}", exc_info=True)
+            if self.error_log_writer:
+                self.error_log_writer.write_error(f"Display results error: {str(e)}", exc_info=True)
             self.set_processing_state(False)
             messagebox.showerror("Error", f"Failed to display results: {str(e)}")
     
@@ -980,11 +1643,26 @@ class FieldMapperApp:
         
         # Aggregate results by field name
         field_stats = defaultdict(lambda: {'matched': 0, 'unmatched_db': 0, 'unmatched_json': 0, 'category_null': 0})
+        # Track fields that exist in JSON (even if not matched) to avoid false "missing in JSON" reports
+        fields_exist_in_json = set()  # Set of field names that exist in at least one JSON file
+        # Track array fields and which files are missing them
+        array_fields_missing_files = defaultdict(list)  # {field_name: [list of file names where missing]}
+        # Get field_category_mapping to identify array fields
+        database = self.database_var.get()
+        field_category_mapping = {}
+        if database:
+            field_category_mapping = self.field_loader.get_field_category_mapping(database)
+        array_field_names = set(field_category_mapping.keys()) if field_category_mapping else set()
         
         for result in all_results:
             field_name = result.get('field_name', '')
             status = result.get('status', '')
             match_type = result.get('match_type', '')
+            json_file = result.get('json_file', '')
+            
+            # Track fields that exist in JSON (matched or unmatched_json)
+            if status in ['matched', 'unmatched_json']:
+                fields_exist_in_json.add(field_name)
             
             if status == 'matched':
                 field_stats[field_name]['matched'] += 1
@@ -993,6 +1671,11 @@ class FieldMapperApp:
                     field_stats[field_name]['category_null'] += 1
                 else:
                     field_stats[field_name]['unmatched_db'] += 1
+                    # Track missing files for array fields
+                    if field_name in array_field_names and json_file:
+                        file_name = os.path.basename(json_file)
+                        if file_name not in array_fields_missing_files[field_name]:
+                            array_fields_missing_files[field_name].append(file_name)
             elif status == 'unmatched_json':
                 field_stats[field_name]['unmatched_json'] += 1
         
@@ -1014,10 +1697,34 @@ class FieldMapperApp:
                 match_type = f"matched ({stats['matched']} times)"
             # Skip category_null - don't display as unmatched
             elif stats['unmatched_db'] > 0:
-                unmatched_db_count += stats['unmatched_db']
-                tag = 'unmatched_db'
-                status = 'unmatched_db'
-                match_type = f"not_found ({stats['unmatched_db']} times)"
+                # For array fields: report if missing in some files (even if exists in others)
+                # For non-array fields: only report if never found in any file
+                if field_name in array_field_names:
+                    # Array field: report with file names where it's missing
+                    missing_files = array_fields_missing_files.get(field_name, [])
+                    if missing_files:
+                        # Create a readable list of missing files (limit to first 10 for display)
+                        if len(missing_files) <= 10:
+                            files_str = ', '.join(missing_files)
+                        else:
+                            files_str = ', '.join(missing_files[:10]) + f" and {len(missing_files) - 10} more"
+                        unmatched_db_count += stats['unmatched_db']
+                        tag = 'unmatched_db'
+                        status = 'unmatched_db'
+                        match_type = f"not_found in: {files_str}"
+                    else:
+                        # No missing files tracked (shouldn't happen, but skip to be safe)
+                        continue
+                else:
+                    # Non-array field: only report if it does NOT exist in JSON in any file
+                    if field_name not in fields_exist_in_json:
+                        unmatched_db_count += stats['unmatched_db']
+                        tag = 'unmatched_db'
+                        status = 'unmatched_db'
+                        match_type = f"not_found ({stats['unmatched_db']} times)"
+                    else:
+                        # Field exists in JSON in some files, skip unmatched_db report
+                        continue
             elif stats['unmatched_json'] > 0:
                 unmatched_json_count += stats['unmatched_json']
                 tag = 'unmatched_json'
@@ -1276,7 +1983,17 @@ Fields from all annexures/tables:
             
             text_widget = scrolledtext.ScrolledText(window, wrap=tk.WORD, padx=10, pady=10)
             text_widget.pack(fill=tk.BOTH, expand=True)
-            text_widget.insert(1.0, message)
+            # Optimize text insertion for large messages
+            text_widget.config(state=tk.NORMAL)
+            if len(message) > 100000:
+                chunk_size = 50000
+                chunks = [message[i:i+chunk_size] for i in range(0, len(message), chunk_size)]
+                text_widget.insert(1.0, chunks[0])
+                for chunk in chunks[1:]:
+                    text_widget.insert(tk.END, chunk)
+                    text_widget.update_idletasks()
+            else:
+                text_widget.insert(1.0, message)
             text_widget.config(state=tk.DISABLED)
             
             ttk.Button(window, text="Close", command=window.destroy).pack(pady=5)
@@ -1324,7 +2041,17 @@ Fields from all annexures/tables:
         
         text_widget = scrolledtext.ScrolledText(window, wrap=tk.WORD, padx=10, pady=10)
         text_widget.pack(fill=tk.BOTH, expand=True)
-        text_widget.insert(1.0, message)
+        # Optimize text insertion for large messages
+        text_widget.config(state=tk.NORMAL)
+        if len(message) > 100000:
+            chunk_size = 50000
+            chunks = [message[i:i+chunk_size] for i in range(0, len(message), chunk_size)]
+            text_widget.insert(1.0, chunks[0])
+            for chunk in chunks[1:]:
+                text_widget.insert(tk.END, chunk)
+                text_widget.update_idletasks()
+        else:
+            text_widget.insert(1.0, message)
         text_widget.config(state=tk.DISABLED)
         
         ttk.Button(window, text="Close", command=window.destroy).pack(pady=5)
@@ -1343,6 +2070,9 @@ Fields from all annexures/tables:
         # Create a scrolled text widget
         text_widget = scrolledtext.ScrolledText(window, wrap=tk.WORD, padx=10, pady=10, font=("Courier", 9))
         text_widget.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Disable widget updates during insertion for better performance
+        text_widget.config(state=tk.NORMAL)
         
         message = "SPECIAL CHARACTER VALIDATION REPORT\n"
         message += "=" * 80 + "\n\n"
@@ -1402,9 +2132,12 @@ Fields from all annexures/tables:
                 message += f"\n  • {field}:\n"
                 message += f"      Special characters: [{chars_str}]\n"
                 
-                # Show all occurrences with file names and line numbers
-                # Only show occurrences that actually have special characters
-                for file_name, line_num, sample, occ_chars in info['occurrences']:
+                # Show occurrences with file names and line numbers
+                # Limit to first 50 occurrences per field to prevent UI freezing
+                occurrences_to_show = info['occurrences'][:50]
+                total_occurrences = len(info['occurrences'])
+                
+                for file_name, line_num, sample, occ_chars in occurrences_to_show:
                     # Double-check this occurrence has special characters
                     if not occ_chars or len(occ_chars) == 0:
                         continue
@@ -1418,6 +2151,10 @@ Fields from all annexures/tables:
                     if sample:
                         sample_display = sample[:100] + '...' if len(sample) > 100 else sample
                         message += f"        Sample value: \"{sample_display}\"\n"
+                
+                # Show truncation message if there are more occurrences
+                if total_occurrences > 50:
+                    message += f"      ... ({total_occurrences - 50} more occurrence(s) not shown)\n"
         
         text_widget.insert(1.0, message)
         text_widget.config(state=tk.DISABLED)
@@ -1668,6 +2405,134 @@ Fields from all annexures/tables:
         self.is_processing = False
         
         messagebox.showinfo("Cleared", "JSON fields and comparison results cleared.\nAnnexure fields remain loaded.")
+    
+    def _open_log_file(self, log_file_path: str, log_type: str = "log"):
+        """Helper method to open a log file in the default text editor"""
+        try:
+            if not log_file_path:
+                messagebox.showerror("Error", f"{log_type} file path not found.")
+                return
+            
+            if not os.path.exists(log_file_path):
+                messagebox.showerror("Error", f"{log_type} file not found:\n{log_file_path}")
+                return
+            
+            # Open the log file with the default system application
+            system = platform.system()
+            try:
+                if system == 'Windows':
+                    os.startfile(log_file_path)
+                elif system == 'Darwin':  # macOS
+                    subprocess.run(['open', log_file_path])
+                else:  # Linux and other Unix-like systems
+                    subprocess.run(['xdg-open', log_file_path])
+                
+                logger.info(f"Opened {log_type} file: {log_file_path}")
+            except Exception as e:
+                # Fallback: try to open with notepad on Windows or default editor
+                try:
+                    if system == 'Windows':
+                        subprocess.run(['notepad', log_file_path])
+                    else:
+                        # Try common text editors
+                        editors = ['gedit', 'nano', 'vi', 'vim', 'code', 'subl']
+                        for editor in editors:
+                            try:
+                                subprocess.run([editor, log_file_path])
+                                break
+                            except FileNotFoundError:
+                                continue
+                        else:
+                            raise Exception("No suitable text editor found")
+                except Exception as fallback_error:
+                    messagebox.showerror("Error", 
+                                       f"Failed to open {log_type} file:\n{str(e)}\n\n"
+                                       f"Please manually open:\n{log_file_path}")
+                    logger.error(f"Failed to open {log_type} file: {str(e)}", exc_info=True)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open {log_type} file: {str(e)}")
+            logger.error(f"Log viewer error: {str(e)}", exc_info=True)
+    
+    def show_log_menu(self):
+        """Show a menu to select which log file to open"""
+        if not self.current_log_files:
+            messagebox.showinfo("No Log Files", "No log files available. Please run a comparison first.")
+            return
+        
+        # Create a popup menu
+        menu = tk.Menu(self.root, tearoff=0)
+        
+        # Add option to open logs folder
+        menu.add_command(label="Open Logs Folder", command=self.view_log_files)
+        menu.add_separator()
+        
+        # Build list of available log files
+        log_options = []
+        
+        # Special Characters Log (only final, available after processing)
+        if not self.is_processing:
+            final_path = self.current_log_files.get('special_chars')
+            if final_path and os.path.exists(final_path):
+                log_options.append(("Special Characters", final_path, "Special characters logs"))
+        
+        # Field Matching Log (only final, available after processing)
+        if not self.is_processing:
+            final_path = self.current_log_files.get('field_matching')
+            if final_path and os.path.exists(final_path):
+                log_options.append(("Field Matching", final_path, "Field matching logs"))
+        
+        # Error Log (always available if it exists)
+        error_path = self.current_log_files.get('errors')
+        if error_path and os.path.exists(error_path):
+            log_options.append(("Error Log", error_path, "Error log"))
+        
+        # Add log file options to menu
+        if log_options:
+            for label, file_path, log_type in log_options:
+                menu.add_command(label=label, command=lambda p=file_path, t=log_type: self._open_log_file(p, t))
+        else:
+            menu.add_command(label="No log files available yet", state=tk.DISABLED)
+        
+        # Show menu at button location
+        try:
+            # Get button position
+            button_x = self.view_logs_button.winfo_rootx()
+            button_y = self.view_logs_button.winfo_rooty() + self.view_logs_button.winfo_height()
+            menu.post(button_x, button_y)
+        except Exception as e:
+            # Fallback: show menu at cursor position
+            menu.post(self.root.winfo_pointerx(), self.root.winfo_pointery())
+    
+    def view_log_files(self):
+        """Open the logs folder in file explorer"""
+        try:
+            logs_dir = os.path.abspath(self.logs_dir)
+            
+            if not os.path.exists(logs_dir):
+                messagebox.showerror("Error", f"Logs directory not found:\n{logs_dir}")
+                return
+            
+            # Open the logs directory in file explorer
+            system = platform.system()
+            try:
+                if system == 'Windows':
+                    os.startfile(logs_dir)
+                elif system == 'Darwin':  # macOS
+                    subprocess.run(['open', logs_dir])
+                else:  # Linux and other Unix-like systems
+                    subprocess.run(['xdg-open', logs_dir])
+                
+                logger.info(f"Opened logs directory: {logs_dir}")
+            except Exception as e:
+                messagebox.showerror("Error", 
+                                   f"Failed to open logs directory:\n{str(e)}\n\n"
+                                   f"Please manually open:\n{logs_dir}")
+                logger.error(f"Failed to open logs directory: {str(e)}", exc_info=True)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open logs directory: {str(e)}")
+            logger.error(f"Log viewer error: {str(e)}", exc_info=True)
 
 
 def main():

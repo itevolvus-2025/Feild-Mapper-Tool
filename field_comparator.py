@@ -29,9 +29,9 @@ class FieldComparator:
         self.fuzzy_match = fuzzy_match
         self.similarity_threshold = similarity_threshold
         
-        # Fields to exclude from special character validation
+        # Default fields to exclude from special character validation
         # These fields are expected to contain special characters (like SMILES notation, HELM notation, etc.)
-        self.excluded_from_validation = {
+        self.default_excluded_from_validation = {
             'helm', 'helms', 'helmnotation', 'helm_notation',
             'molstructure', 'molstructure_smiles', 'molstructuresmiles',
             'smiles', 'smile', 'smiles_notation', 'smilesnotation',
@@ -41,15 +41,29 @@ class FieldComparator:
             'modification_in_smiles', 'modificationinsmiles','parameters', 'parameter'
         }
         
+        # Database-specific excluded keywords (can be set per database)
+        self.database_excluded_keywords = {}  # Format: {database_name: [list of keywords]}
+        
         # Store validation results
         self.validation_results = {'db': [], 'json': []}
+    
+    def set_database_excluded_keywords(self, database_name: str, excluded_keywords: List[str]):
+        """
+        Set excluded keywords for a specific database
+        
+        Args:
+            database_name: Name of the database
+            excluded_keywords: List of keywords to exclude from special character validation
+        """
+        self.database_excluded_keywords[database_name] = excluded_keywords
     
     def compare(self, db_fields: List[str], json_fields: List[str], 
                 table_name: str = "", json_file: str = "",
                 field_category_mapping: Dict[str, str] = None,
                 null_categories: Dict[str, bool] = None,
                 array_field_mapping: Dict[str, str] = None,
-                json_data: Any = None) -> List[Dict]:
+                json_data: Any = None,
+                database_name: str = "") -> List[Dict]:
         """
         Compare database fields with JSON fields
         
@@ -164,9 +178,12 @@ class FieldComparator:
                         normalized_cat = normalized_cat.lower()
                     category_is_null = normalized_null_categories.get(normalized_cat, False)
                 
-                # Skip fields with null/empty arrays or categories - don't count as unmatched
-                if array_is_null or category_is_null:
-                    continue  # Don't add to results if array/category is null/empty
+                # If array/category is null but field exists in database config, still report it as unmatched_db
+                # This allows fields from null arrays to be properly tracked (missing in JSON)
+                # Only skip if the field is not in the database config mapping (not a valid database field)
+                # If field IS in database config (in normalized_category_mapping), include it even if array is null
+                if (array_is_null or category_is_null) and db_field not in normalized_category_mapping:
+                    continue  # Skip only if not a valid database field (not in config)
                 
                 # Get original field name for display
                 original_db_field = db_normalized_to_original.get(db_field, db_field)
@@ -203,12 +220,12 @@ class FieldComparator:
         
         # Validate field VALUES for special characters (if JSON data is provided)
         if json_data is not None:
-            self._validate_field_values(json_data, json_fields, table_name, json_file)
+            self._validate_field_values(json_data, json_fields, table_name, json_file, database_name)
         
         return results
     
     def _validate_field_values(self, json_data: Any, json_fields: List[str], 
-                               table_name: str = "", json_file: str = ""):
+                               table_name: str = "", json_file: str = "", database_name: str = ""):
         """
         Validate field VALUES for special characters (excluding certain fields)
         
@@ -234,8 +251,8 @@ class FieldComparator:
         logger.debug(f"Validating {len(field_values)} field values for special characters in {json_file}")
         
         for field_path, value in field_values.items():
-            # Skip if field should be excluded from validation
-            if self._is_excluded_field(field_path):
+            # Skip if field should be excluded from validation (using database-specific exclusions)
+            if self._is_excluded_field_with_database(field_path, database_name):
                 continue
             
             # Only check string values - skip arrays/objects as they're structured data
@@ -478,9 +495,7 @@ class FieldComparator:
     def _is_excluded_field(self, field_name: str) -> bool:
         """
         Check if field should be excluded from special character validation
-        
-        Fields containing: helm, molstructure, smiles/smile are excluded
-        as they are expected to contain special characters (like SMILES notation, HELM notation, etc.)
+        (Uses default exclusions only - for backward compatibility)
         
         Args:
             field_name: Field name to check
@@ -488,34 +503,58 @@ class FieldComparator:
         Returns:
             True if field should be excluded, False otherwise
         """
+        return self._is_excluded_field_with_database(field_name, "")
+    
+    def _is_excluded_field_with_database(self, field_name: str, database_name: str = "") -> bool:
+        """
+        Check if field should be excluded from special character validation
+        Uses database-specific excluded keywords if available
+        
+        Fields containing: helm, molstructure, smiles/smile are excluded
+        as they are expected to contain special characters (like SMILES notation, HELM notation, etc.)
+        
+        Args:
+            field_name: Field name to check
+            database_name: Name of the database (for database-specific exclusions)
+        
+        Returns:
+            True if field should be excluded, False otherwise
+        """
         # Normalize field name for comparison (lowercase, remove spaces, underscores, hyphens, dots, colons)
         normalized = field_name.lower().replace(' ', '').replace('_', '').replace('-', '').replace('.', '').replace(':', '')
         
-        # Check if normalized field name matches any excluded pattern
-        for excluded in self.excluded_from_validation:
+        # Check if normalized field name matches any default excluded pattern
+        for excluded in self.default_excluded_from_validation:
             if excluded in normalized or normalized in excluded:
                 return True
         
-        # Check if field name contains excluded keywords (case-insensitive)
-        field_lower = field_name.lower()
-        excluded_keywords = ['helm', 'smiles', 'smile', 'molstructure', 'molstructures']
+        # Get database-specific excluded keywords
+        excluded_keywords = []
+        if database_name and database_name in self.database_excluded_keywords:
+            excluded_keywords = self.database_excluded_keywords[database_name]
         
-        # Check for exact matches or if keyword is part of the field name
+        # Normalize field name for keyword matching (lowercase, remove spaces, underscores, hyphens, dots, colons)
+        field_normalized = field_name.lower().replace(' ', '').replace('_', '').replace('-', '').replace('.', '').replace(':', '')
+        
+        # Check if field name contains excluded keywords (normalize both field and keyword)
         for keyword in excluded_keywords:
-            if keyword in field_lower:
+            # Normalize keyword the same way (lowercase, remove spaces, underscores, hyphens, dots, colons)
+            keyword_normalized = keyword.lower().replace(' ', '').replace('_', '').replace('-', '').replace('.', '').replace(':', '')
+            if keyword_normalized in field_normalized:
                 return True
         
-        # Also check for common variations
+        # Also check default excluded patterns (common variations)
+        # Use normalized field name for these checks too
         # Check for "MolStructure" (case variations)
-        if 'molstructure' in field_lower or 'mol structure' in field_lower:
+        if 'molstructure' in field_normalized or 'molstructure' in normalized:
             return True
         
         # Check for "HELM" variations
-        if 'helm' in field_lower:
+        if 'helm' in field_normalized or 'helm' in normalized:
             return True
         
         # Check for "SMILES" variations
-        if 'smiles' in field_lower or 'smile' in field_lower:
+        if 'smiles' in field_normalized or 'smile' in field_normalized:
             return True
         
         return False
