@@ -1767,181 +1767,225 @@ class FieldMapperApp:
                            f"Note: Fields with null/empty arrays are excluded from unmatched count.")
     
     def update_summary(self, matched, unmatched_db, unmatched_json):
-        """Update summary tab"""
+        """Update summary tab - simple summary only, detailed logs are in log files"""
         self.summary_text.delete(1.0, tk.END)
         
-        summary = f"""
-FIELD COMPARISON SUMMARY
-{'='*50}
-
-ANNEXURE FIELDS (All Annexures Combined):
-{'-'*50}
-Total Fields: {len(self.all_db_fields)}
-Total Annexures: {len(self.field_loader.get_databases()) if self.loader_data else 0}
-
-Fields from all annexures/tables:
-{', '.join(self.all_db_fields[:50])}
-{f'... and {len(self.all_db_fields) - 50} more fields' if len(self.all_db_fields) > 50 else ''}
-"""
+        # Count unique unmatched fields without loading all details
+        total_unmatched_db_count = unmatched_db
+        total_unmatched_json_count = unmatched_json
         
-        summary += f"\n\nJSON FIELDS:\n{'-'*50}\n"
-        for json_file, fields in self.json_fields.items():
-            summary += f"\nFile: {os.path.basename(json_file)}\n"
-            summary += f"Total Fields: {len(fields)}\n"
-            summary += f"Fields: {', '.join(fields)}\n"
+        # Count special character fields (just count, don't process details)
+        special_chars_db_count = len(set(f.get('field', '') for f in self.fields_with_special_chars['db'])) if self.fields_with_special_chars['db'] else 0
+        special_chars_json_count = len(set(f.get('field', '') for f in self.fields_with_special_chars['json'])) if self.fields_with_special_chars['json'] else 0
         
-        summary += f"\n\nCOMPARISON RESULTS:\n{'-'*50}\n"
-        summary += f"Matched Fields: {matched}\n"
-        summary += f"Missing in JSON: {unmatched_db}\n"
-        summary += f"Not found under annexure: {unmatched_json}\n"
-        summary += f"Total Compared: {matched + unmatched_db + unmatched_json}\n"
-        
-        # Add unmatched fields details
-        unmatched_fields = self.get_unmatched_fields()
-        if unmatched_fields['unmatched_db'] or unmatched_fields['unmatched_json'] or unmatched_fields['category_null']:
-            summary += f"\n\nUNMATCHED FIELDS DETAILS:\n{'-'*50}\n"
-            
-            if unmatched_fields['unmatched_db']:
-                summary += f"\nMissing in JSON Fields ({len(unmatched_fields['unmatched_db'])}):\n"
-                for field_info in unmatched_fields['unmatched_db']:
-                    summary += f"  - {field_info['field_name']}: {field_info['match_type']}\n"
-            
-            if unmatched_fields['category_null']:
-                summary += f"\nFields with Null Categories ({len(unmatched_fields['category_null'])}):\n"
-                for field_info in unmatched_fields['category_null']:
-                    summary += f"  - {field_info['field_name']}: {field_info['match_type']}\n"
-            
-            if unmatched_fields['unmatched_json']:
-                summary += f"\nFields not found under annexure ({len(unmatched_fields['unmatched_json'])}):\n"
-                for field_info in unmatched_fields['unmatched_json']:
-                    summary += f"  - {field_info['field_name']}: {field_info['match_type']}\n"
-        
-        # Add per-record details for multi-record files
-        # First, check if we have any multi-record files
-        has_multi_record_files = False
+        # Count multi-record files with issues (just count, don't process details)
+        multi_record_files_count = 0
+        total_records_with_issues = 0
         for json_file in self.json_fields.keys():
             records = self.json_parser.get_records(json_file)
             if len(records) > 1:
-                has_multi_record_files = True
-                break
+                multi_record_files_count += 1
+                record_info = self.record_unmatched_info.get(json_file, {})
+                total_records_with_issues += len(record_info)
         
-        if has_multi_record_files:
-            summary += f"\n\nPER-RECORD ANALYSIS (Multi-Record Files):\n{'-'*50}\n"
-            
-            # Check all JSON files to see if any are multi-record
-            for json_file, fields in self.json_fields.items():
-                records = self.json_parser.get_records(json_file)
-                if len(records) > 1:
-                    # This is a multi-record file
-                    total_records = len(records)
-                    record_info = self.record_unmatched_info.get(json_file, {})
-                    records_with_issues = len(record_info)
-                    
-                    summary += f"\nFile: {os.path.basename(json_file)}\n"
-                    summary += f"Total Records: {total_records}\n"
-                    summary += f"Records with Unmatched Fields: {records_with_issues}\n"
-                    
-                    if records_with_issues > 0:
-                        summary += f"\nRecords with Issues:\n"
-                        # Show ALL records with issues (user requested to see all records)
-                        all_record_numbers = sorted(list(record_info.keys()))
-                        for record_idx in all_record_numbers:
-                            info = record_info[record_idx]
-                            summary += f"  Record {record_idx}:\n"
-                            if info.get('unmatched_json'):
-                                unmatched_list = info['unmatched_json']
-                                summary += f"    - Fields not found under annexure ({len(unmatched_list)}): {', '.join(unmatched_list[:5])}{'...' if len(unmatched_list) > 5 else ''}\n"
-                            if info.get('unmatched_db'):
-                                unmatched_list = info['unmatched_db']
-                                summary += f"    - Missing Annexure fields ({len(unmatched_list)}): {', '.join(unmatched_list[:5])}{'...' if len(unmatched_list) > 5 else ''}\n"
-                    else:
-                        summary += f"  ✓ All {total_records} records match annexure fields correctly\n"
-        
-        # Add special character validation results (always show section)
-        summary += f"\n\nSPECIAL CHARACTER VALIDATION:\n{'-'*50}\n"
-        summary += f"Fields with special characters in VALUES (excluding HELM, MolStructure, SMILES fields):\n\n"
-        
-        if not self.fields_with_special_chars['db'] and not self.fields_with_special_chars['json']:
-            summary += f"No special characters found in field values.\n\n"
-        else:
-            if self.fields_with_special_chars['db']:
-                # Group by field name to show unique fields with their special characters
-                field_to_chars = {}
-                for f in self.fields_with_special_chars['db']:
-                    field_name = f['field']
-                    special_chars = f.get('special_chars', [])
-                    if field_name not in field_to_chars:
-                        field_to_chars[field_name] = set()
-                    field_to_chars[field_name].update(special_chars)
-                
-                unique_db_fields = sorted(field_to_chars.keys())
-                summary += f"Annexure Fields ({len(unique_db_fields)}):\n"
-                for field in unique_db_fields:
-                    chars_list = sorted(list(field_to_chars[field]))
-                    chars_str = ', '.join([f"'{c}'" for c in chars_list])
-                    summary += f"  - {field}: special characters [{chars_str}]\n"
-            
-            if self.fields_with_special_chars['json']:
-                # Group by field name to show unique fields with their special characters, file names, and line numbers
-                # Only include entries that actually have special characters
-                field_to_info = {}
-                for f in self.fields_with_special_chars['json']:
-                    field_name = f['field']
-                    special_chars = f.get('special_chars', [])
-                    
-                    # Skip if no special characters found (shouldn't happen, but double-check)
-                    if not special_chars or len(special_chars) == 0:
-                        continue
-                    
-                    sample_value = f.get('sample_value', '')
-                    file_path = f.get('file', '')
-                    line_number = f.get('line_number')
-                    
-                    if field_name not in field_to_info:
-                        field_to_info[field_name] = {
-                            'special_chars': set(),
-                            'sample_value': sample_value,
-                            'files': []  # List of (file, line_number) tuples
-                        }
-                    field_to_info[field_name]['special_chars'].update(special_chars)
-                    # Keep the first sample value found
-                    if not field_to_info[field_name]['sample_value']:
-                        field_to_info[field_name]['sample_value'] = sample_value
-                    # Add file and line number info
-                    if file_path:
-                        file_name = os.path.basename(file_path)
-                        field_to_info[field_name]['files'].append((file_name, line_number))
-                
-                unique_json_fields = sorted(field_to_info.keys())
-                summary += f"\nJSON Fields ({len(unique_json_fields)}):\n"
-                for field in unique_json_fields:
-                    info = field_to_info[field]
-                    chars_list = sorted(list(info['special_chars']))
-                    chars_str = ', '.join([f"'{c}'" for c in chars_list])
-                    sample = info['sample_value']
-                    
-                    # Build file and line number info
-                    file_info_parts = []
-                    for file_name, line_num in info['files']:
-                        if line_num:
-                            file_info_parts.append(f"{file_name}:{line_num}")
-                        else:
-                            file_info_parts.append(file_name)
-                    file_info = ", ".join(file_info_parts) if file_info_parts else ""
-                    
-                    if sample:
-                        sample_display = sample[:80] + '...' if len(sample) > 80 else sample
-                        if file_info:
-                            summary += f"  - {field}: special characters [{chars_str}], file: {file_info}, sample value: \"{sample_display}\"\n"
-                        else:
-                            summary += f"  - {field}: special characters [{chars_str}], sample value: \"{sample_display}\"\n"
-                    else:
-                        if file_info:
-                            summary += f"  - {field}: special characters [{chars_str}], file: {file_info}\n"
-                        else:
-                            summary += f"  - {field}: special characters [{chars_str}]\n"
+        summary = f"""
+FIELD COMPARISON SUMMARY
+{'='*60}
+
+ANNEXURE FIELDS:
+{'-'*60}
+Total Annexure Fields: {len(self.all_db_fields)}
+Total Annexures: {len(self.field_loader.get_databases()) if self.loader_data else 0}
+
+JSON FILES:
+{'-'*60}
+Total JSON Files Processed: {len(self.json_fields):,}
+
+COMPARISON RESULTS:
+{'-'*60}
+Matched Fields: {matched:,}
+Missing in JSON: {unmatched_db:,}
+Not found under annexure: {unmatched_json:,}
+Total Compared: {matched + unmatched_db + unmatched_json:,}
+
+UNMATCHED FIELDS SUMMARY:
+{'-'*60}
+Missing in JSON Fields: {total_unmatched_db_count:,}
+Fields not found under annexure: {total_unmatched_json_count:,}
+
+MULTI-RECORD FILES:
+{'-'*60}
+Multi-record files processed: {multi_record_files_count:,}
+Total records with unmatched fields: {total_records_with_issues:,}
+
+SPECIAL CHARACTER VALIDATION:
+{'-'*60}
+Annexure fields with special characters: {special_chars_db_count:,}
+JSON fields with special characters: {special_chars_json_count:,}
+
+{'='*60}
+NOTE: Detailed logs with full field names, file details, per-record analysis,
+and special character information are available in the log files.
+Check the 'logs' folder for complete information.
+{'='*60}
+"""
         
         self.summary_text.insert(1.0, summary)
+        
+        # ============================================================================
+        # OLD DETAILED CODE - COMMENTED OUT FOR PERFORMANCE (causes crashes with large datasets)
+        # All detailed information is still logged to log files
+        # ============================================================================
+        
+        # # OLD CODE: Show all annexure fields with list
+        # summary += f"\n\nANNEXURE FIELDS (All Annexures Combined):\n{'-'*50}\n"
+        # summary += f"Total Fields: {len(self.all_db_fields)}\n"
+        # summary += f"Total Annexures: {len(self.field_loader.get_databases()) if self.loader_data else 0}\n"
+        # summary += f"Fields from all annexures/tables:\n"
+        # summary += f"{', '.join(self.all_db_fields[:50])}\n"
+        # if len(self.all_db_fields) > 50:
+        #     summary += f"... and {len(self.all_db_fields) - 50} more fields\n"
+        
+        # # OLD CODE: Iterate through all JSON files to show details (SLOW for large datasets)
+        # summary += f"\n\nJSON FIELDS:\n{'-'*50}\n"
+        # for json_file, fields in self.json_fields.items():
+        #     summary += f"\nFile: {os.path.basename(json_file)}\n"
+        #     summary += f"Total Fields: {len(fields)}\n"
+        #     summary += f"Fields: {', '.join(fields)}\n"
+        
+        # # OLD CODE: Get unmatched fields details (VERY SLOW - iterates through millions of tree items)
+        # unmatched_fields = self.get_unmatched_fields()
+        # if unmatched_fields['unmatched_db'] or unmatched_fields['unmatched_json'] or unmatched_fields['category_null']:
+        #     summary += f"\n\nUNMATCHED FIELDS DETAILS:\n{'-'*50}\n"
+        #     
+        #     if unmatched_fields['unmatched_db']:
+        #         summary += f"\nMissing in JSON Fields ({len(unmatched_fields['unmatched_db'])}):\n"
+        #         for field_info in unmatched_fields['unmatched_db']:
+        #             summary += f"  - {field_info['field_name']}: {field_info['match_type']}\n"
+        #     
+        #     if unmatched_fields['category_null']:
+        #         summary += f"\nFields with Null Categories ({len(unmatched_fields['category_null'])}):\n"
+        #         for field_info in unmatched_fields['category_null']:
+        #             summary += f"  - {field_info['field_name']}: {field_info['match_type']}\n"
+        #     
+        #     if unmatched_fields['unmatched_json']:
+        #         summary += f"\nFields not found under annexure ({len(unmatched_fields['unmatched_json'])}):\n"
+        #         for field_info in unmatched_fields['unmatched_json']:
+        #             summary += f"  - {field_info['field_name']}: {field_info['match_type']}\n"
+        
+        # # OLD CODE: Per-record details for multi-record files (VERY SLOW for large datasets)
+        # has_multi_record_files = False
+        # for json_file in self.json_fields.keys():
+        #     records = self.json_parser.get_records(json_file)
+        #     if len(records) > 1:
+        #         has_multi_record_files = True
+        #         break
+        # 
+        # if has_multi_record_files:
+        #     summary += f"\n\nPER-RECORD ANALYSIS (Multi-Record Files):\n{'-'*50}\n"
+        #     
+        #     for json_file, fields in self.json_fields.items():
+        #         records = self.json_parser.get_records(json_file)
+        #         if len(records) > 1:
+        #             total_records = len(records)
+        #             record_info = self.record_unmatched_info.get(json_file, {})
+        #             records_with_issues = len(record_info)
+        #             
+        #             summary += f"\nFile: {os.path.basename(json_file)}\n"
+        #             summary += f"Total Records: {total_records}\n"
+        #             summary += f"Records with Unmatched Fields: {records_with_issues}\n"
+        #             
+        #             if records_with_issues > 0:
+        #                 summary += f"\nRecords with Issues:\n"
+        #                 all_record_numbers = sorted(list(record_info.keys()))
+        #                 for record_idx in all_record_numbers:
+        #                     info = record_info[record_idx]
+        #                     summary += f"  Record {record_idx}:\n"
+        #                     if info.get('unmatched_json'):
+        #                         unmatched_list = info['unmatched_json']
+        #                         summary += f"    - Fields not found under annexure ({len(unmatched_list)}): {', '.join(unmatched_list[:5])}{'...' if len(unmatched_list) > 5 else ''}\n"
+        #                     if info.get('unmatched_db'):
+        #                         unmatched_list = info['unmatched_db']
+        #                         summary += f"    - Missing Annexure fields ({len(unmatched_list)}): {', '.join(unmatched_list[:5])}{'...' if len(unmatched_list) > 5 else ''}\n"
+        #             else:
+        #                 summary += f"  ✓ All {total_records} records match annexure fields correctly\n"
+        
+        # # OLD CODE: Special character validation results (SLOW for large datasets)
+        # summary += f"\n\nSPECIAL CHARACTER VALIDATION:\n{'-'*50}\n"
+        # summary += f"Fields with special characters in VALUES (excluding HELM, MolStructure, SMILES fields):\n\n"
+        # 
+        # if not self.fields_with_special_chars['db'] and not self.fields_with_special_chars['json']:
+        #     summary += f"No special characters found in field values.\n\n"
+        # else:
+        #     if self.fields_with_special_chars['db']:
+        #         field_to_chars = {}
+        #         for f in self.fields_with_special_chars['db']:
+        #             field_name = f['field']
+        #             special_chars = f.get('special_chars', [])
+        #             if field_name not in field_to_chars:
+        #                 field_to_chars[field_name] = set()
+        #             field_to_chars[field_name].update(special_chars)
+        #         
+        #         unique_db_fields = sorted(field_to_chars.keys())
+        #         summary += f"Annexure Fields ({len(unique_db_fields)}):\n"
+        #         for field in unique_db_fields:
+        #             chars_list = sorted(list(field_to_chars[field]))
+        #             chars_str = ', '.join([f"'{c}'" for c in chars_list])
+        #             summary += f"  - {field}: special characters [{chars_str}]\n"
+        #     
+        #     if self.fields_with_special_chars['json']:
+        #         field_to_info = {}
+        #         for f in self.fields_with_special_chars['json']:
+        #             field_name = f['field']
+        #             special_chars = f.get('special_chars', [])
+        #             
+        #             if not special_chars or len(special_chars) == 0:
+        #                 continue
+        #             
+        #             sample_value = f.get('sample_value', '')
+        #             file_path = f.get('file', '')
+        #             line_number = f.get('line_number')
+        #             
+        #             if field_name not in field_to_info:
+        #                 field_to_info[field_name] = {
+        #                     'special_chars': set(),
+        #                     'sample_value': sample_value,
+        #                     'files': []
+        #                 }
+        #             field_to_info[field_name]['special_chars'].update(special_chars)
+        #             if not field_to_info[field_name]['sample_value']:
+        #                 field_to_info[field_name]['sample_value'] = sample_value
+        #             if file_path:
+        #                 file_name = os.path.basename(file_path)
+        #                 field_to_info[field_name]['files'].append((file_name, line_number))
+        #         
+        #         unique_json_fields = sorted(field_to_info.keys())
+        #         summary += f"\nJSON Fields ({len(unique_json_fields)}):\n"
+        #         for field in unique_json_fields:
+        #             info = field_to_info[field]
+        #             chars_list = sorted(list(info['special_chars']))
+        #             chars_str = ', '.join([f"'{c}'" for c in chars_list])
+        #             sample = info['sample_value']
+        #             
+        #             file_info_parts = []
+        #             for file_name, line_num in info['files']:
+        #                 if line_num:
+        #                     file_info_parts.append(f"{file_name}:{line_num}")
+        #                 else:
+        #                     file_info_parts.append(file_name)
+        #             file_info = ", ".join(file_info_parts) if file_info_parts else ""
+        #             
+        #             if sample:
+        #                 sample_display = sample[:80] + '...' if len(sample) > 80 else sample
+        #                 if file_info:
+        #                     summary += f"  - {field}: special characters [{chars_str}], file: {file_info}, sample value: \"{sample_display}\"\n"
+        #                 else:
+        #                     summary += f"  - {field}: special characters [{chars_str}], sample value: \"{sample_display}\"\n"
+        #             else:
+        #                 if file_info:
+        #                     summary += f"  - {field}: special characters [{chars_str}], file: {file_info}\n"
+        #                 else:
+        #                     summary += f"  - {field}: special characters [{chars_str}]\n"
     
     def show_unmatched_fields(self):
         """Display unmatched fields in a message box"""

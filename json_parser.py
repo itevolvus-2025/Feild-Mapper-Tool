@@ -5,8 +5,17 @@ Extracts field names from JSON files with support for nested structures
 
 import json
 import os
-from typing import List, Set, Dict, Any, Optional
+from typing import List, Set, Dict, Any, Optional, Tuple
 import logging
+import shutil
+
+# Try to import chardet for encoding detection (optional dependency)
+try:
+    import chardet  # type: ignore
+    HAS_CHARDET = True
+except ImportError:
+    HAS_CHARDET = False
+    chardet = None  # type: ignore
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -15,17 +24,114 @@ logger = logging.getLogger(__name__)
 class JSONParser:
     def __init__(self):
         self.field_cache = {}
+        self.json_data_cache = {}  # Cache loaded JSON data to avoid reloading
+        self.logged_files = set()  # Track which files we've already logged
+    
+    def _detect_encoding(self, file_path: str) -> str:
+        """
+        Detect file encoding using multiple methods
+        
+        Returns:
+            Detected encoding name, or 'utf-8' as default
+        """
+        # List of encodings to try (in order of preference)
+        common_encodings = ['utf-8', 'utf-8-sig']
+        
+        # Try chardet if available (more accurate detection)
+        if HAS_CHARDET:
+            try:
+                with open(file_path, 'rb') as f:
+                    raw_data = f.read(10000)  # Read first 10KB for detection
+                    if raw_data:
+                        result = chardet.detect(raw_data)
+                        if result and result.get('encoding'):
+                            detected_encoding = result['encoding'].lower()
+                            confidence = result.get('confidence', 0)
+                            # Only use if confidence is reasonable
+                            if confidence > 0.7:
+                                # Normalize encoding name
+                                if detected_encoding.startswith('utf-8'):
+                                    return 'utf-8'
+                                elif detected_encoding.startswith('utf-16'):
+                                    return 'utf-16'
+                                # Add detected encoding to try list if not already there
+                                if detected_encoding not in common_encodings:
+                                    common_encodings.insert(1, detected_encoding)
+            except Exception as e:
+                logger.debug(f"Failed to detect encoding with chardet for {file_path}: {str(e)}")
+        
+        # Try common encodings in order
+        for encoding in common_encodings:
+            try:
+                with open(file_path, 'r', encoding=encoding) as f:
+                    f.read(1)  # Try to read at least one character
+                return encoding
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+            except Exception:
+                continue
+        
+        # Default to utf-8 if all else fails
+        return 'utf-8'
+    
+    def _read_file_with_encoding(self, file_path: str) -> Tuple[str, str]:
+        """
+        Read file content trying multiple encodings
+        
+        Returns:
+            Tuple of (content, encoding_used)
+        """
+        # Detect encoding first
+        detected_encoding = self._detect_encoding(file_path)
+        
+        # List of encodings to try (detected first, then fallbacks)
+        encodings_to_try = [detected_encoding, 'utf-8', 'utf-8-sig', 'utf-16', 'utf-16-le', 'utf-16-be']
+        # Remove duplicates while preserving order
+        seen = set()
+        encodings_to_try = [enc for enc in encodings_to_try if not (enc in seen or seen.add(enc))]
+        
+        last_error = None
+        for encoding in encodings_to_try:
+            try:
+                with open(file_path, 'r', encoding=encoding) as f:
+                    content = f.read()
+                # If we get here, reading was successful
+                if detected_encoding != encoding:
+                    logger.debug(f"File {file_path} read with {encoding} (detected: {detected_encoding})")
+                return content, encoding
+            except UnicodeDecodeError as e:
+                last_error = e
+                continue
+            except Exception as e:
+                last_error = e
+                continue
+        
+        # If all encodings fail, raise the last error
+        if last_error:
+            raise UnicodeDecodeError(
+                last_error.encoding if hasattr(last_error, 'encoding') else 'unknown',
+                last_error.object if hasattr(last_error, 'object') else b'',
+                last_error.start if hasattr(last_error, 'start') else 0,
+                last_error.end if hasattr(last_error, 'end') else 0,
+                f"Failed to decode file with any encoding. Last error: {str(last_error)}"
+            )
+        else:
+            raise IOError(f"Failed to read file {file_path} with any encoding")
     
     def load_json(self, file_path: str) -> Any:
         """
-        Load JSON file with error handling for malformed JSON and indentation fixing
+        Load JSON file with error handling for malformed JSON and automatic encoding detection
         
         Returns:
             Dict, List, or other JSON-serializable type depending on file content
         """
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
+            # Read file with automatic encoding detection
+            content, encoding_used = self._read_file_with_encoding(file_path)
+            
+            # Log encoding if different from UTF-8 (only once per file)
+            if file_path not in self.logged_files and encoding_used != 'utf-8':
+                logger.info(f"JSON file {file_path} detected encoding: {encoding_used}")
             
             # Check if JSON is minified (no indentation)
             is_minified = self._is_json_minified(content)
@@ -36,16 +142,19 @@ class JSONParser:
             try:
                 data = json.loads(content)
                 
-                # Log the structure type for debugging
-                if isinstance(data, list):
-                    logger.info(f"JSON file {file_path} contains an array with {len(data)} record(s)")
-                elif isinstance(data, dict):
-                    logger.info(f"JSON file {file_path} contains a single object")
-                else:
-                    logger.info(f"JSON file {file_path} contains a {type(data).__name__} value")
+                # Log the structure type for debugging (only once per file)
+                if file_path not in self.logged_files:
+                    if isinstance(data, list):
+                        logger.info(f"JSON file {file_path} contains an array with {len(data)} record(s)")
+                    elif isinstance(data, dict):
+                        logger.info(f"JSON file {file_path} contains a single object")
+                    else:
+                        logger.info(f"JSON file {file_path} contains a {type(data).__name__} value")
+                    
+                    if is_minified:
+                        logger.info(f"Successfully parsed minified JSON from {file_path}")
+                    self.logged_files.add(file_path)
                 
-                if is_minified:
-                    logger.info(f"Successfully parsed minified JSON from {file_path}")
                 return data
             except json.JSONDecodeError as e:
                 # Try to fix common JSON issues
@@ -78,7 +187,7 @@ class JSONParser:
                 return None
                 
         except UnicodeDecodeError as e:
-            logger.error(f"Unicode decode error in {file_path}: {str(e)}")
+            logger.error(f"Unicode decode error in {file_path}: {str(e)}. Tried multiple encodings.")
             return None
         except Exception as e:
             logger.error(f"Failed to load JSON file {file_path}: {str(e)}")
@@ -557,4 +666,132 @@ class JSONParser:
                 'extra': [],
                 'matched': []
             }
+    
+    def clean_special_characters(self, data: Any, database_name: str, field_path: str = "") -> Tuple[Any, int]:
+        """
+        Remove specific special characters from specific fields based on database configuration
+        
+        Args:
+            data: JSON data (dict, list, or nested structure)
+            database_name: Name of the database for configuration lookup
+            field_path: Current field path (for nested structures)
+        
+        Returns:
+            Tuple of (cleaned_data, characters_removed_count)
+        """
+        try:
+            import database_config
+            removal_config = getattr(database_config, 'SPECIAL_CHAR_REMOVAL', {})
+            
+            # If no configuration for this database, return data unchanged
+            if database_name not in removal_config:
+                return data, 0
+            
+            field_config = removal_config[database_name]
+            if not field_config:
+                return data, 0
+            
+            total_removed = 0
+            
+            # Normalize field names for comparison (lowercase, remove spaces/underscores/hyphens)
+            def normalize_name(name: str) -> str:
+                return name.lower().replace(' ', '').replace('_', '').replace('-', '').replace('.', '').replace(':', '')
+            
+            # Create normalized lookup dictionary
+            normalized_config = {}
+            for field_name, chars_to_remove in field_config.items():
+                normalized_name = normalize_name(field_name)
+                normalized_config[normalized_name] = chars_to_remove
+            
+            if isinstance(data, dict):
+                cleaned_data = {}
+                for key, value in data.items():
+                    # Check if this field should have characters removed
+                    normalized_key = normalize_name(key)
+                    current_path = f"{field_path}.{key}" if field_path else key
+                    
+                    if normalized_key in normalized_config:
+                        chars_to_remove = normalized_config[normalized_key]
+                        if isinstance(value, str):
+                            # Remove specified characters from string value
+                            original_value = value
+                            for char in chars_to_remove:
+                                value = value.replace(char, '')
+                            removed_count = len(original_value) - len(value)
+                            total_removed += removed_count
+                            if removed_count > 0:
+                                logger.debug(f"Removed {removed_count} special character(s) from field '{current_path}' in {database_name}")
+                            cleaned_data[key] = value
+                        elif isinstance(value, (dict, list)):
+                            # Recursively clean nested structures
+                            cleaned_value, removed = self.clean_special_characters(value, database_name, current_path)
+                            cleaned_data[key] = cleaned_value
+                            total_removed += removed
+                        else:
+                            cleaned_data[key] = value
+                    elif isinstance(value, (dict, list)):
+                        # Recursively process nested structures even if field name doesn't match
+                        cleaned_value, removed = self.clean_special_characters(value, database_name, current_path)
+                        cleaned_data[key] = cleaned_value
+                        total_removed += removed
+                    else:
+                        cleaned_data[key] = value
+                
+                return cleaned_data, total_removed
+            
+            elif isinstance(data, list):
+                cleaned_list = []
+                for idx, item in enumerate(data):
+                    current_path = f"{field_path}[{idx}]" if field_path else f"[{idx}]"
+                    if isinstance(item, (dict, list)):
+                        cleaned_item, removed = self.clean_special_characters(item, database_name, current_path)
+                        cleaned_list.append(cleaned_item)
+                        total_removed += removed
+                    else:
+                        cleaned_list.append(item)
+                
+                return cleaned_list, total_removed
+            
+            else:
+                return data, 0
+                
+        except Exception as e:
+            logger.error(f"Error cleaning special characters: {str(e)}", exc_info=True)
+            return data, 0
+    
+    def save_cleaned_json(self, original_file_path: str, cleaned_data: Any, output_dir: str = None) -> Optional[str]:
+        """
+        Save cleaned JSON data to a file
+        
+        Args:
+            original_file_path: Path to original JSON file
+            cleaned_data: Cleaned JSON data
+            output_dir: Directory to save cleaned file (default: 'cleaned_json' folder next to original)
+        
+        Returns:
+            Path to saved cleaned file, or None if failed
+        """
+        try:
+            if output_dir is None:
+                # Create 'cleaned_json' folder in the same directory as the original file
+                original_dir = os.path.dirname(os.path.abspath(original_file_path))
+                output_dir = os.path.join(original_dir, 'cleaned_json')
+            
+            # Create output directory if it doesn't exist
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Generate output filename (keep original name)
+            original_filename = os.path.basename(original_file_path)
+            output_path = os.path.join(output_dir, original_filename)
+            
+            # Write cleaned JSON with proper indentation
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(cleaned_data, f, indent=2, ensure_ascii=False)
+            
+            logger.info(f"Saved cleaned JSON to: {output_path}")
+            return output_path
+            
+        except Exception as e:
+            logger.error(f"Failed to save cleaned JSON: {str(e)}", exc_info=True)
+            return None
 
