@@ -219,7 +219,7 @@ def setup_logging(database_name: str = ""):
     
     # Field matching log - write final summary only
     class FieldMatchingFileWriter:
-        """Write field matching logs - final summary only"""
+        """Write field matching logs - detailed per-file field-level logging"""
         def __init__(self, final_filename):
             self.final_filename = final_filename
             # Data for final summary log
@@ -229,6 +229,9 @@ def setup_logging(database_name: str = ""):
             self.total_matched = 0
             self.total_unmatched_db = 0
             self.total_unmatched_json = 0
+            # Per-file field tracking for detailed logging
+            self.file_field_details = {}  # {file_name: {'missing_in_json': [], 'not_in_annexure': []}}
+            self.current_file = None
         
         def write_comparison_summary(self, matched, unmatched_db, unmatched_json):
             """Store totals for final log"""
@@ -240,41 +243,90 @@ def setup_logging(database_name: str = ""):
             """Store unmatched DB field data for final summary log"""
             # Store for final summary
             self.unmatched_db_fields.append({'field_name': field_name, 'match_type': match_type})
+            # Store for current file if set
+            if self.current_file:
+                if self.current_file not in self.file_field_details:
+                    self.file_field_details[self.current_file] = {'missing_in_json': [], 'not_in_annexure': []}
+                self.file_field_details[self.current_file]['missing_in_json'].append({'field_name': field_name, 'match_type': match_type})
         
         def write_unmatched_json_field(self, field_name, match_type):
             """Store unmatched JSON field data for final summary log"""
             # Store for final summary
             self.unmatched_json_fields.append({'field_name': field_name, 'match_type': match_type})
+            # Store for current file if set
+            if self.current_file:
+                if self.current_file not in self.file_field_details:
+                    self.file_field_details[self.current_file] = {'missing_in_json': [], 'not_in_annexure': []}
+                self.file_field_details[self.current_file]['not_in_annexure'].append({'field_name': field_name, 'match_type': match_type})
         
         def write_file_result(self, file_name, matched, unmatched_db, unmatched_json):
             """Store per-file result data for final summary log"""
             # Store for final summary
             self.file_results.append((file_name, matched, unmatched_db, unmatched_json))
+            # Set current file for field tracking
+            self.current_file = file_name
         
         def finalize(self):
-            """Write final summary log"""
+            """Write final summary log with detailed per-file field information"""
             # Write final summary log
             final_file = open(self.final_filename, 'w', encoding='utf-8')
             final_file.write("FIELD COMPARISON SUMMARY\n")
-            final_file.write("="*50 + "\n\n")
-            final_file.write("COMPARISON RESULTS:\n")
-            final_file.write("-"*50 + "\n")
+            final_file.write("="*80 + "\n\n")
+            final_file.write("OVERALL COMPARISON RESULTS:\n")
+            final_file.write("-"*80 + "\n")
             final_file.write(f"Matched Fields: {self.total_matched}\n")
             final_file.write(f"Missing in JSON: {self.total_unmatched_db}\n")
             final_file.write(f"Not found under annexure: {self.total_unmatched_json}\n")
             final_file.write(f"Total Compared: {self.total_matched + self.total_unmatched_db + self.total_unmatched_json}\n\n")
             
-            if self.file_results:
-                final_file.write("PER-FILE RESULTS:\n")
-                final_file.write("-"*50 + "\n")
-                for file_name, matched, unmatched_db, unmatched_json in self.file_results:
-                    final_file.write(f"File: {file_name}\n")
-                    final_file.write(f"  Matched: {matched}, Missing in JSON: {unmatched_db}, Not in Annexure: {unmatched_json}\n")
+            # DETAILED PER-FILE FIELD-LEVEL LOGGING
+            if self.file_field_details:
                 final_file.write("\n")
+                final_file.write("="*80 + "\n")
+                final_file.write("DETAILED PER-FILE FIELD ANALYSIS\n")
+                final_file.write("="*80 + "\n\n")
+                
+                for file_name in sorted(self.file_field_details.keys()):
+                    details = self.file_field_details[file_name]
+                    missing_in_json = details.get('missing_in_json', [])
+                    not_in_annexure = details.get('not_in_annexure', [])
+                    
+                    final_file.write("-"*80 + "\n")
+                    final_file.write(f"FILE: {file_name}\n")
+                    final_file.write("-"*80 + "\n")
+                    
+                    if missing_in_json:
+                        final_file.write(f"\n  Fields Missing in JSON ({len(missing_in_json)}):\n")
+                        for field_info in missing_in_json:
+                            final_file.write(f"    - {field_info['field_name']}: {field_info['match_type']}\n")
+                    else:
+                        final_file.write(f"\n  Fields Missing in JSON: None\n")
+                    
+                    if not_in_annexure:
+                        final_file.write(f"\n  Fields Not Found Under Annexure ({len(not_in_annexure)}):\n")
+                        for field_info in not_in_annexure:
+                            final_file.write(f"    - {field_info['field_name']}: {field_info['match_type']}\n")
+                    else:
+                        final_file.write(f"\n  Fields Not Found Under Annexure: None\n")
+                    
+                    final_file.write("\n")
             
+            # SUMMARY STATISTICS
+            if self.file_results:
+                final_file.write("\n")
+                final_file.write("="*80 + "\n")
+                final_file.write("PER-FILE SUMMARY STATISTICS\n")
+                final_file.write("="*80 + "\n\n")
+                for file_name, matched, unmatched_db, unmatched_json in self.file_results:
+                    final_file.write(f"{file_name}\n")
+                    final_file.write(f"  Matched: {matched}, Missing in JSON: {unmatched_db}, Not in Annexure: {unmatched_json}\n\n")
+            
+            # UNIQUE FIELDS SUMMARY (across all files)
             if self.unmatched_db_fields or self.unmatched_json_fields:
-                final_file.write("UNMATCHED FIELDS DETAILS:\n")
-                final_file.write("-"*50 + "\n")
+                final_file.write("\n")
+                final_file.write("="*80 + "\n")
+                final_file.write("UNIQUE UNMATCHED FIELDS (ACROSS ALL FILES)\n")
+                final_file.write("="*80 + "\n\n")
                 
                 if self.unmatched_db_fields:
                     unique_db = {}
@@ -283,7 +335,7 @@ def setup_logging(database_name: str = ""):
                         if field_name not in unique_db:
                             unique_db[field_name] = field_info['match_type']
                     
-                    final_file.write(f"\nMissing in JSON Fields ({len(unique_db)}):\n")
+                    final_file.write(f"Missing in JSON Fields ({len(unique_db)}):\n")
                     for field_name, match_type in sorted(unique_db.items()):
                         final_file.write(f"  - {field_name}: {match_type}\n")
                 
@@ -423,11 +475,6 @@ class FieldMapperApp:
         
         ttk.Button(json_frame, text="Browse Folder", 
                   command=self.browse_json_folder).grid(row=0, column=2, padx=5, pady=5)
-        
-        ttk.Label(json_frame, text="JSON Path (optional):").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
-        self.json_path_var = tk.StringVar()
-        json_path_entry = ttk.Entry(json_frame, textvariable=self.json_path_var, width=40)
-        json_path_entry.grid(row=1, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
         
         # Results Section
         results_frame = ttk.LabelFrame(main_frame, text="Comparison Results", padding="10")
@@ -642,23 +689,32 @@ class FieldMapperApp:
             messagebox.showerror("Error", error_msg)
     
     def browse_json_folder(self):
-        """Browse for folder containing JSON files and process them in batches"""
+        """Browse for folder containing JSON files and process them in batches (includes subfolders)"""
         folder = filedialog.askdirectory(title="Select Folder with JSON Files")
         if folder:
             try:
-                # Find all JSON files in the folder
-                json_files = glob.glob(os.path.join(folder, "*.json"))
+                # Find all JSON files in the folder and all subfolders recursively
+                json_files = glob.glob(os.path.join(folder, "**", "*.json"), recursive=True)
                 
                 if not json_files:
                     messagebox.showwarning("No JSON Files", 
-                                         f"No JSON files found in {folder}")
+                                         f"No JSON files found in {folder} or its subfolders")
                     return
+                
+                # Count files in root vs subfolders for user information
+                root_files = [f for f in json_files if os.path.dirname(f) == folder]
+                subfolder_files = len(json_files) - len(root_files)
+                
+                location_info = f"{len(root_files)} in root"
+                if subfolder_files > 0:
+                    location_info += f", {subfolder_files} in subfolders"
                 
                 # Ask user for confirmation if many files
                 if len(json_files) > 100:
                     response = messagebox.askyesno(
                         "Confirm Batch Load",
-                        f"Found {len(json_files)} JSON files. This will process files during comparison to save memory. Continue?"
+                        f"Found {len(json_files)} JSON files ({location_info}).\n"
+                        f"This will process files during comparison to save memory. Continue?"
                     )
                     if not response:
                         return
@@ -670,10 +726,10 @@ class FieldMapperApp:
                 self.json_folder_var.set(folder)  # Update UI display
                 
                 messagebox.showinfo("Folder Selected", 
-                                   f"Selected folder with {len(json_files)} JSON files.\n"
+                                   f"Selected folder with {len(json_files)} JSON files ({location_info}).\n"
                                    f"Files will be processed during comparison to optimize memory usage.")
                 
-                logger.info(f"Selected folder with {len(json_files)} JSON files: {folder}")
+                logger.info(f"Selected folder with {len(json_files)} JSON files ({location_info}): {folder}")
                 
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to select folder: {str(e)}")
@@ -862,27 +918,12 @@ class FieldMapperApp:
                     for json_file in batch:
                         try:
                             # PERFORMANCE OPTIMIZATION: Load JSON once and reuse for all operations
-                            json_path = self.json_path_var.get()
-                            
                             # Load JSON data once (cached for subsequent operations)
                             json_data = self.json_parser.load_json(json_file)
                             if json_data is None:
                                 file_stats['failed'] += 1
                                 processed += 1
                                 continue
-                            
-                            # Navigate to json_path if specified (do this once)
-                            if json_path:
-                                try:
-                                    json_data = self.json_parser._navigate_path(json_data, json_path)
-                                    if json_data is None:
-                                        file_stats['failed'] += 1
-                                        processed += 1
-                                        continue
-                                except Exception:
-                                    file_stats['failed'] += 1
-                                    processed += 1
-                                    continue
                             
                             # Extract fields from already-loaded data (avoid re-reading file)
                             if json_file in self.json_fields:
@@ -1014,7 +1055,7 @@ class FieldMapperApp:
                                     field_stats[field_name]['unmatched_json'] += 1
                             
                             # Per-record logging for multi-record files (only log records with unmatched fields)
-                            records = self.json_parser.get_records(json_file, json_path)
+                            records = self.json_parser.get_records(json_file)
                             if len(records) > 1:
                                 records_with_unmatched = []
                                 total_unmatched_json = 0
@@ -1270,24 +1311,11 @@ class FieldMapperApp:
                     for json_file in batch:
                         try:
                             # PERFORMANCE OPTIMIZATION: Load JSON once and reuse for all operations
-                            json_path = self.json_path_var.get()
-                            
                             # Load JSON data once (cached for subsequent operations)
                             json_data = self.json_parser.load_json(json_file)
                             if json_data is None:
                                 processed += 1
                                 continue
-                            
-                            # Navigate to json_path if specified (do this once)
-                            if json_path:
-                                try:
-                                    json_data = self.json_parser._navigate_path(json_data, json_path)
-                                    if json_data is None:
-                                        processed += 1
-                                        continue
-                                except Exception:
-                                    processed += 1
-                                    continue
                             
                             # Extract fields from already-loaded data (avoid re-reading file)
                             if json_file in self.json_fields:
@@ -1387,8 +1415,7 @@ class FieldMapperApp:
                                             )
                             
                             # Per-record logging for multi-record files (only log records with unmatched fields)
-                            json_path = self.json_path_var.get()
-                            records = self.json_parser.get_records(json_file, json_path)
+                            records = self.json_parser.get_records(json_file)
                             if len(records) > 1:
                                 # Update UI to show multi-record processing
                                 self.update_progress(processed, total_files, f"Processing {os.path.basename(json_file)}: {len(records)} records")
