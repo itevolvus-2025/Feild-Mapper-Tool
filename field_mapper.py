@@ -387,6 +387,7 @@ from document_parser import DocumentParser
 from field_loader import FieldLoader
 from json_parser import JSONParser
 from field_comparator import FieldComparator
+from json_validator import JSONValidator
 
 
 class FieldMapperApp:
@@ -400,6 +401,7 @@ class FieldMapperApp:
         self.field_loader = FieldLoader()
         self.json_parser = JSONParser()
         self.comparator = FieldComparator()
+        self.json_validator = JSONValidator()
         
         # Data storage
         self.db_fields = {}  # Format: {'database_name.table_name': [fields]}
@@ -547,6 +549,10 @@ class FieldMapperApp:
         # Action Buttons
         button_frame = ttk.Frame(main_frame)
         button_frame.grid(row=4, column=0, columnspan=5, pady=10)
+        
+        self.validate_json_button = ttk.Button(button_frame, text="Validate JSON", 
+                  command=self.validate_json_files)
+        self.validate_json_button.pack(side=tk.LEFT, padx=5)
         
         self.compare_button = ttk.Button(button_frame, text="Compare Fields", 
                   command=self.compare_fields)
@@ -784,6 +790,228 @@ class FieldMapperApp:
             self.progress_status_var.set(status_msg)
         else:
             self.progress_status_var.set(message if message else "Processing...")
+    
+    def validate_json_files(self):
+        """Validate JSON files for syntax and structure errors"""
+        try:
+            # Check if we have JSON files to validate
+            if not self.json_files_list:
+                messagebox.showerror("Error", 
+                                    "Please select a JSON folder first")
+                return
+            
+            # Confirm if there are many files
+            total_files = len(self.json_files_list)
+            if total_files > 100:
+                response = messagebox.askyesno(
+                    "Validate JSON Files",
+                    f"You are about to validate {total_files} JSON files.\n\n"
+                    "This may take some time. Continue?"
+                )
+                if not response:
+                    return
+            
+            # Set processing state
+            self.set_processing_state(True)
+            
+            # Initialize progress bar
+            self.progress_bar['maximum'] = total_files
+            self.progress_bar['value'] = 0
+            self.update_progress(0, total_files, "Starting JSON validation...")
+            
+            # Start validation in background thread
+            thread = threading.Thread(
+                target=self._process_json_validation,
+                args=(self.json_files_list,),
+                daemon=True
+            )
+            thread.start()
+            
+        except Exception as e:
+            self.set_processing_state(False)
+            messagebox.showerror("Error", f"Failed to start validation: {str(e)}")
+            logger.error(f"Validation start error: {str(e)}", exc_info=True)
+    
+    def _process_json_validation(self, json_files: List[str]):
+        """Process JSON validation in background thread"""
+        try:
+            total_files = len(json_files)
+            validation_results = {
+                'total_files': total_files,
+                'valid_files': 0,
+                'invalid_files': 0,
+                'files_with_warnings': 0,
+                'details': []
+            }
+            
+            # Validate each file
+            for idx, json_file in enumerate(json_files, 1):
+                try:
+                    # Update progress
+                    if idx % 10 == 0 or idx == total_files:
+                        self.root.after(0, self.update_progress, idx, total_files, 
+                                      f"Validating file {idx}/{total_files}...")
+                    
+                    # Validate file
+                    result = self.json_validator.validate_file(json_file)
+                    validation_results['details'].append(result)
+                    
+                    if result['valid']:
+                        validation_results['valid_files'] += 1
+                    else:
+                        validation_results['invalid_files'] += 1
+                    
+                    if result['warnings']:
+                        validation_results['files_with_warnings'] += 1
+                    
+                except Exception as e:
+                    logger.error(f"Error validating {json_file}: {str(e)}")
+                    validation_results['details'].append({
+                        'valid': False,
+                        'file': json_file,
+                        'errors': [f"Validation error: {str(e)}"],
+                        'warnings': [],
+                        'info': {}
+                    })
+                    validation_results['invalid_files'] += 1
+            
+            # Generate and save report
+            logs_dir = "logs"
+            if not os.path.exists(logs_dir):
+                os.makedirs(logs_dir)
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            report_path = os.path.join(logs_dir, f"json_validation_{timestamp}.log")
+            
+            report_text = self.json_validator.generate_report(validation_results, report_path)
+            
+            # Show results in UI
+            self.root.after(0, self._show_validation_results, validation_results, report_path)
+            
+            # Complete
+            self.root.after(0, self.set_processing_state, False)
+            self.root.after(0, self.update_progress, total_files, total_files, "Validation complete!")
+            
+        except Exception as e:
+            logger.error(f"Validation processing error: {str(e)}", exc_info=True)
+            self.root.after(0, self.set_processing_state, False)
+            self.root.after(0, messagebox.showerror, "Error", 
+                          f"Validation failed: {str(e)}")
+    
+    def _show_validation_results(self, validation_results: Dict, report_path: str):
+        """Show validation results in a popup window"""
+        window = tk.Toplevel(self.root)
+        window.title("JSON Validation Results")
+        window.geometry("900x700")
+        
+        # Summary frame
+        summary_frame = ttk.LabelFrame(window, text="Validation Summary", padding=10)
+        summary_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        summary_text = f"""
+Total Files: {validation_results['total_files']}
+Valid Files: {validation_results['valid_files']}
+Invalid Files: {validation_results['invalid_files']}
+Files with Warnings: {validation_results['files_with_warnings']}
+
+Report saved to: {report_path}
+        """
+        
+        summary_label = tk.Label(summary_frame, text=summary_text, justify=tk.LEFT, 
+                                font=("Arial", 10))
+        summary_label.pack()
+        
+        # Results frame with tabs
+        notebook = ttk.Notebook(window)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Invalid files tab
+        if validation_results['invalid_files'] > 0:
+            invalid_frame = ttk.Frame(notebook)
+            notebook.add(invalid_frame, text=f"Invalid Files ({validation_results['invalid_files']})")
+            
+            invalid_text = scrolledtext.ScrolledText(invalid_frame, wrap=tk.WORD, 
+                                                    font=("Courier New", 9))
+            invalid_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+            
+            for detail in validation_results['details']:
+                if not detail['valid']:
+                    invalid_text.insert(tk.END, f"\n{'='*80}\n")
+                    invalid_text.insert(tk.END, f"File: {os.path.basename(detail['file'])}\n")
+                    invalid_text.insert(tk.END, f"Path: {detail['file']}\n\n")
+                    
+                    if detail['errors']:
+                        invalid_text.insert(tk.END, "Errors:\n")
+                        for error in detail['errors']:
+                            invalid_text.insert(tk.END, f"  ✗ {error}\n")
+                    
+                    if detail.get('info', {}).get('suggestions'):
+                        invalid_text.insert(tk.END, "\nSuggestions:\n")
+                        for suggestion in detail['info']['suggestions']:
+                            invalid_text.insert(tk.END, f"  → {suggestion}\n")
+            
+            invalid_text.config(state=tk.DISABLED)
+        
+        # Files with warnings tab
+        if validation_results['files_with_warnings'] > 0:
+            warnings_frame = ttk.Frame(notebook)
+            notebook.add(warnings_frame, text=f"Warnings ({validation_results['files_with_warnings']})")
+            
+            warnings_text = scrolledtext.ScrolledText(warnings_frame, wrap=tk.WORD, 
+                                                     font=("Courier New", 9))
+            warnings_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+            
+            for detail in validation_results['details']:
+                if detail['warnings']:
+                    warnings_text.insert(tk.END, f"\n{'='*80}\n")
+                    warnings_text.insert(tk.END, f"File: {os.path.basename(detail['file'])}\n")
+                    warnings_text.insert(tk.END, f"Path: {detail['file']}\n\n")
+                    
+                    warnings_text.insert(tk.END, "Warnings:\n")
+                    for warning in detail['warnings']:
+                        warnings_text.insert(tk.END, f"  ⚠ {warning}\n")
+                    
+                    # Show additional info
+                    if detail.get('info'):
+                        info = detail['info']
+                        if 'file_size_mb' in info:
+                            warnings_text.insert(tk.END, f"\nFile Size: {info['file_size_mb']} MB\n")
+                        if 'max_nesting_depth' in info:
+                            warnings_text.insert(tk.END, f"Max Nesting Depth: {info['max_nesting_depth']}\n")
+            
+            warnings_text.config(state=tk.DISABLED)
+        
+        # Valid files tab
+        valid_frame = ttk.Frame(notebook)
+        notebook.add(valid_frame, text=f"Valid Files ({validation_results['valid_files']})")
+        
+        valid_text = scrolledtext.ScrolledText(valid_frame, wrap=tk.WORD, 
+                                              font=("Courier New", 9))
+        valid_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        for detail in validation_results['details']:
+            if detail['valid'] and not detail['warnings']:
+                valid_text.insert(tk.END, f"✓ {os.path.basename(detail['file'])}\n")
+                if detail.get('info'):
+                    info = detail['info']
+                    if 'root_type' in info:
+                        valid_text.insert(tk.END, f"  Type: {info['root_type']}")
+                        if info['root_type'] == 'dict' and 'field_count' in info:
+                            valid_text.insert(tk.END, f", Fields: {info['field_count']}")
+                        elif info['root_type'] == 'list' and 'array_length' in info:
+                            valid_text.insert(tk.END, f", Length: {info['array_length']}")
+                        valid_text.insert(tk.END, "\n")
+        
+        valid_text.config(state=tk.DISABLED)
+        
+        # Buttons
+        button_frame = ttk.Frame(window)
+        button_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        ttk.Button(button_frame, text="Open Report File", 
+                  command=lambda: self.open_file_in_default_app(report_path)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Close", 
+                  command=window.destroy).pack(side=tk.RIGHT, padx=5)
     
     def compare_fields(self):
         """Compare database fields with JSON fields - starts background thread"""
@@ -1250,6 +1478,7 @@ class FieldMapperApp:
                 # it should NOT be reported as "missing in JSON" (unmatched_db),
                 # even if it's missing in other files (e.g., where parent array is null)
                 all_results = []
+                logger.info(f"Converting {len(field_stats)} field stats to results format")
                 for field_name, stats in field_stats.items():
                     if stats['matched'] > 0:
                         # Field exists and matches in at least one file - mark as matched
@@ -1297,6 +1526,11 @@ class FieldMapperApp:
                             'db_field': '',
                             'json_field': field_name
                         })
+                
+                logger.info(f"Built {len(all_results)} results from {len(field_stats)} field stats")
+                logger.info(f"Results breakdown: matched={sum(1 for r in all_results if r.get('status') == 'matched')}, "
+                          f"unmatched_db={sum(1 for r in all_results if r.get('status') == 'unmatched_db')}, "
+                          f"unmatched_json={sum(1 for r in all_results if r.get('status') == 'unmatched_json')}")
                 
                 # Schedule UI update on main thread
                 self.root.after(0, self._display_results_complete, all_results, file_stats, processed)
@@ -1569,6 +1803,24 @@ class FieldMapperApp:
     def _display_results_complete(self, all_results: List[Dict], file_stats: Dict = None, processed: int = 0):
         """Display results on main thread"""
         try:
+            # Clear previous results first
+            for item in self.results_tree.get_children():
+                self.results_tree.delete(item)
+            
+            # Check if we have any results
+            if not all_results or len(all_results) == 0:
+                logger.warning(f"No results to display. all_results is empty or None. Processed: {processed} files")
+                self.set_processing_state(False)
+                self.update_progress(processed, processed, "Comparison complete - No results to display")
+                messagebox.showwarning("No Results", 
+                                     f"Comparison completed but no results were generated.\n"
+                                     f"Processed: {processed} files\n\n"
+                                     f"This may indicate:\n"
+                                     f"- No fields matched between annexure and JSON files\n"
+                                     f"- All JSON files were empty or invalid\n"
+                                     f"- Check the log files for details")
+                return
+            
             # For large batches, use aggregated view
             if len(all_results) > 5000:
                 self._display_aggregated_results(all_results)
@@ -1588,6 +1840,8 @@ class FieldMapperApp:
                 
                 # Track which fields we've already added to avoid duplicates
                 seen_fields = set()
+                
+                logger.info(f"Displaying {len(all_results)} results in GUI")
                 
                 for result in all_results:
                     status = result['status']
@@ -1628,13 +1882,28 @@ class FieldMapperApp:
                         unmatched_json_count += 1
                         tag = 'unmatched_json'
                     
-                    self.results_tree.insert("", tk.END,
-                                           text=field_name,
-                                           values=(display_status, 
-                                                  result.get('db_field', ''),
-                                                  result.get('json_field', ''),
-                                                  match_type),
-                                           tags=(tag,))
+                    try:
+                        self.results_tree.insert("", tk.END,
+                                               text=field_name,
+                                               values=(display_status, 
+                                                      result.get('db_field', ''),
+                                                      result.get('json_field', ''),
+                                                      match_type),
+                                               tags=(tag,))
+                    except Exception as e:
+                        logger.error(f"Error inserting result into tree: {str(e)}. Result: {result}")
+                        continue
+                
+                # Verify items were added
+                items_added = len(self.results_tree.get_children())
+                logger.info(f"Added {items_added} items to results tree. Expected: {len(seen_fields)} unique fields")
+                
+                if items_added == 0:
+                    logger.warning("No items were added to results tree despite having results!")
+                    messagebox.showwarning("Display Issue", 
+                                         f"Results were generated but could not be displayed.\n"
+                                         f"Total results: {len(all_results)}\n"
+                                         f"Check log files for details.")
                 
                 # Configure tags for coloring
                 self.results_tree.tag_configure('matched', background='#d4edda')
@@ -1647,11 +1916,15 @@ class FieldMapperApp:
                 # Reset processing state
                 self.set_processing_state(False)
                 
+                # Update progress to show completion
+                self.update_progress(processed, total_files, "Comparison complete!")
+                
                 messagebox.showinfo("Comparison Complete", 
                                   f"Comparison completed!\n"
                                   f"Matched: {matched_count}\n"
                                   f"Missing in JSON: {unmatched_db_count}\n"
-                                  f"Not found under annexure: {unmatched_json_count}")
+                                  f"Not found under annexure: {unmatched_json_count}\n\n"
+                                  f"Results displayed: {items_added} fields")
         except Exception as e:
             logger.error(f"Display results error: {str(e)}", exc_info=True)
             if self.error_log_writer:
@@ -1666,132 +1939,164 @@ class FieldMapperApp:
     
     def _display_aggregated_results(self, all_results: List[Dict]):
         """Display aggregated results for large datasets to save memory"""
-        from collections import defaultdict
-        
-        # Aggregate results by field name
-        field_stats = defaultdict(lambda: {'matched': 0, 'unmatched_db': 0, 'unmatched_json': 0, 'category_null': 0})
-        # Track fields that exist in JSON (even if not matched) to avoid false "missing in JSON" reports
-        fields_exist_in_json = set()  # Set of field names that exist in at least one JSON file
-        # Track array fields and which files are missing them
-        array_fields_missing_files = defaultdict(list)  # {field_name: [list of file names where missing]}
-        # Get field_category_mapping to identify array fields
-        database = self.database_var.get()
-        field_category_mapping = {}
-        if database:
-            field_category_mapping = self.field_loader.get_field_category_mapping(database)
-        array_field_names = set(field_category_mapping.keys()) if field_category_mapping else set()
-        
-        for result in all_results:
-            field_name = result.get('field_name', '')
-            status = result.get('status', '')
-            match_type = result.get('match_type', '')
-            json_file = result.get('json_file', '')
+        try:
+            from collections import defaultdict
             
-            # Track fields that exist in JSON (matched or unmatched_json)
-            if status in ['matched', 'unmatched_json']:
-                fields_exist_in_json.add(field_name)
+            logger.info(f"Displaying aggregated results for {len(all_results)} results")
             
-            if status == 'matched':
-                field_stats[field_name]['matched'] += 1
-            elif status == 'unmatched_db':
-                if match_type == 'category_null':
-                    field_stats[field_name]['category_null'] += 1
-                else:
-                    field_stats[field_name]['unmatched_db'] += 1
-                    # Track missing files for array fields
-                    if field_name in array_field_names and json_file:
-                        file_name = os.path.basename(json_file)
-                        if file_name not in array_fields_missing_files[field_name]:
-                            array_fields_missing_files[field_name].append(file_name)
-            elif status == 'unmatched_json':
-                field_stats[field_name]['unmatched_json'] += 1
-        
-        # Clear previous results
-        for item in self.results_tree.get_children():
-            self.results_tree.delete(item)
-        
-        # Display aggregated results
-        matched_count = 0
-        unmatched_db_count = 0
-        unmatched_json_count = 0
-        category_null_count = 0
-        
-        for field_name, stats in sorted(field_stats.items()):
-            if stats['matched'] > 0:
-                matched_count += stats['matched']
-                tag = 'matched'
-                status = 'matched'
-                match_type = f"matched ({stats['matched']} times)"
-            # Skip category_null - don't display as unmatched
-            elif stats['unmatched_db'] > 0:
-                # For array fields: report if missing in some files (even if exists in others)
-                # For non-array fields: only report if never found in any file
-                if field_name in array_field_names:
-                    # Array field: report with file names where it's missing
-                    missing_files = array_fields_missing_files.get(field_name, [])
-                    if missing_files:
-                        # Create a readable list of missing files (limit to first 10 for display)
-                        if len(missing_files) <= 10:
-                            files_str = ', '.join(missing_files)
+            if not all_results or len(all_results) == 0:
+                logger.warning("No results to display in aggregated view")
+                self.set_processing_state(False)
+                messagebox.showwarning("No Results", "No results to display in aggregated view")
+                return
+            
+            # Aggregate results by field name
+            field_stats = defaultdict(lambda: {'matched': 0, 'unmatched_db': 0, 'unmatched_json': 0, 'category_null': 0})
+            # Track fields that exist in JSON (even if not matched) to avoid false "missing in JSON" reports
+            fields_exist_in_json = set()  # Set of field names that exist in at least one JSON file
+            # Track array fields and which files are missing them
+            array_fields_missing_files = defaultdict(list)  # {field_name: [list of file names where missing]}
+            # Get field_category_mapping to identify array fields
+            database = self.database_var.get()
+            field_category_mapping = {}
+            if database:
+                field_category_mapping = self.field_loader.get_field_category_mapping(database)
+            array_field_names = set(field_category_mapping.keys()) if field_category_mapping else set()
+            
+            for result in all_results:
+                field_name = result.get('field_name', '')
+                status = result.get('status', '')
+                match_type = result.get('match_type', '')
+                json_file = result.get('json_file', '')
+                
+                # Track fields that exist in JSON (matched or unmatched_json)
+                if status in ['matched', 'unmatched_json']:
+                    fields_exist_in_json.add(field_name)
+                
+                if status == 'matched':
+                    field_stats[field_name]['matched'] += 1
+                elif status == 'unmatched_db':
+                    if match_type == 'category_null':
+                        field_stats[field_name]['category_null'] += 1
+                    else:
+                        field_stats[field_name]['unmatched_db'] += 1
+                        # Track missing files for array fields
+                        if field_name in array_field_names and json_file:
+                            file_name = os.path.basename(json_file)
+                            if file_name not in array_fields_missing_files[field_name]:
+                                array_fields_missing_files[field_name].append(file_name)
+                elif status == 'unmatched_json':
+                    field_stats[field_name]['unmatched_json'] += 1
+            
+            # Clear previous results
+            for item in self.results_tree.get_children():
+                self.results_tree.delete(item)
+            
+            # Display aggregated results
+            matched_count = 0
+            unmatched_db_count = 0
+            unmatched_json_count = 0
+            category_null_count = 0
+            
+            for field_name, stats in sorted(field_stats.items()):
+                if stats['matched'] > 0:
+                    matched_count += stats['matched']
+                    tag = 'matched'
+                    status = 'matched'
+                    match_type = f"matched ({stats['matched']} times)"
+                # Skip category_null - don't display as unmatched
+                elif stats['unmatched_db'] > 0:
+                    # For array fields: report if missing in some files (even if exists in others)
+                    # For non-array fields: only report if never found in any file
+                    if field_name in array_field_names:
+                        # Array field: report with file names where it's missing
+                        missing_files = array_fields_missing_files.get(field_name, [])
+                        if missing_files:
+                            # Create a readable list of missing files (limit to first 10 for display)
+                            if len(missing_files) <= 10:
+                                files_str = ', '.join(missing_files)
+                            else:
+                                files_str = ', '.join(missing_files[:10]) + f" and {len(missing_files) - 10} more"
+                            unmatched_db_count += stats['unmatched_db']
+                            tag = 'unmatched_db'
+                            status = 'unmatched_db'
+                            match_type = f"not_found in: {files_str}"
                         else:
-                            files_str = ', '.join(missing_files[:10]) + f" and {len(missing_files) - 10} more"
-                        unmatched_db_count += stats['unmatched_db']
-                        tag = 'unmatched_db'
-                        status = 'unmatched_db'
-                        match_type = f"not_found in: {files_str}"
+                            # No missing files tracked (shouldn't happen, but skip to be safe)
+                            continue
                     else:
-                        # No missing files tracked (shouldn't happen, but skip to be safe)
-                        continue
+                        # Non-array field: only report if it does NOT exist in JSON in any file
+                        if field_name not in fields_exist_in_json:
+                            unmatched_db_count += stats['unmatched_db']
+                            tag = 'unmatched_db'
+                            status = 'unmatched_db'
+                            match_type = f"not_found ({stats['unmatched_db']} times)"
+                        else:
+                            # Field exists in JSON in some files, skip unmatched_db report
+                            continue
+                elif stats['unmatched_json'] > 0:
+                    unmatched_json_count += stats['unmatched_json']
+                    tag = 'unmatched_json'
+                    status = 'unmatched_json'
+                    display_status = 'not found under annexure'
+                    match_type = f"not_found ({stats['unmatched_json']} times)"
                 else:
-                    # Non-array field: only report if it does NOT exist in JSON in any file
-                    if field_name not in fields_exist_in_json:
-                        unmatched_db_count += stats['unmatched_db']
-                        tag = 'unmatched_db'
-                        status = 'unmatched_db'
-                        match_type = f"not_found ({stats['unmatched_db']} times)"
-                    else:
-                        # Field exists in JSON in some files, skip unmatched_db report
-                        continue
-            elif stats['unmatched_json'] > 0:
-                unmatched_json_count += stats['unmatched_json']
-                tag = 'unmatched_json'
-                status = 'unmatched_json'
-                display_status = 'not found under annexure'
-                match_type = f"not_found ({stats['unmatched_json']} times)"
-            else:
-                # Skip fields that only have category_null
-                continue
+                    # Skip fields that only have category_null
+                    continue
+                
+                # Set display_status for unmatched_db as well
+                if status == 'unmatched_db':
+                    display_status = 'missing in JSON'
+                elif status == 'matched':
+                    display_status = 'matched'
+                
+                try:
+                    self.results_tree.insert("", tk.END,
+                                           text=field_name,
+                                           values=(display_status, '', '', match_type),
+                                           tags=(tag,))
+                except Exception as e:
+                    logger.error(f"Error inserting aggregated result into tree: {str(e)}. Field: {field_name}")
+                    continue
             
-            # Set display_status for unmatched_db as well
-            if status == 'unmatched_db':
-                display_status = 'missing in JSON'
-            elif status == 'matched':
-                display_status = 'matched'
+            # Verify items were added
+            items_added = len(self.results_tree.get_children())
+            logger.info(f"Added {items_added} items to results tree in aggregated view")
             
-            self.results_tree.insert("", tk.END,
-                                   text=field_name,
-                                   values=(display_status, '', '', match_type),
-                                   tags=(tag,))
-        
-        # Configure tags for coloring
-        self.results_tree.tag_configure('matched', background='#d4edda')
-        self.results_tree.tag_configure('unmatched_db', background='#f8d7da')
-        self.results_tree.tag_configure('category_null', background='#ffcccc')
-        self.results_tree.tag_configure('unmatched_json', background='#fff3cd')
-        
-        # Update summary (category_null excluded from unmatched count)
-        self.update_summary(matched_count, unmatched_db_count, unmatched_json_count)
-        
-        # Reset processing state
-        self.set_processing_state(False)
-        
-        messagebox.showinfo("Aggregated Results", 
-                           f"Aggregated results displayed!\n\n"
-                           f"Unique Fields: {len(field_stats)}\n"
-                           f"Total Matches: {matched_count}\n"
-                           f"Missing in JSON: {unmatched_db_count}\n"
-                           f"Not found under annexure: {unmatched_json_count}\n\n"
-                           f"Note: Fields with null/empty arrays are excluded from unmatched count.")
+            if items_added == 0:
+                logger.warning("No items were added to results tree in aggregated view!")
+                self.set_processing_state(False)
+                messagebox.showwarning("Display Issue", 
+                                     f"Results were generated but could not be displayed.\n"
+                                     f"Total results: {len(all_results)}\n"
+                                     f"Field stats: {len(field_stats)}\n"
+                                     f"Check log files for details.")
+                return
+            
+            # Configure tags for coloring
+            self.results_tree.tag_configure('matched', background='#d4edda')
+            self.results_tree.tag_configure('unmatched_db', background='#f8d7da')
+            self.results_tree.tag_configure('category_null', background='#ffcccc')
+            self.results_tree.tag_configure('unmatched_json', background='#fff3cd')
+            
+            # Update summary (category_null excluded from unmatched count)
+            self.update_summary(matched_count, unmatched_db_count, unmatched_json_count)
+            
+            # Reset processing state
+            self.set_processing_state(False)
+            
+            messagebox.showinfo("Aggregated Results", 
+                               f"Aggregated results displayed!\n\n"
+                               f"Unique Fields: {len(field_stats)}\n"
+                               f"Items Displayed: {items_added}\n"
+                               f"Total Matches: {matched_count}\n"
+                               f"Missing in JSON: {unmatched_db_count}\n"
+                               f"Not found under annexure: {unmatched_json_count}\n\n"
+                               f"Note: Fields with null/empty arrays are excluded from unmatched count.")
+        except Exception as e:
+            logger.error(f"Error displaying aggregated results: {str(e)}", exc_info=True)
+            self.set_processing_state(False)
+            messagebox.showerror("Error", f"Failed to display aggregated results: {str(e)}")
     
     def update_summary(self, matched, unmatched_db, unmatched_json):
         """Update summary tab - simple summary only, detailed logs are in log files"""

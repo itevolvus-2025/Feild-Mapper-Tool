@@ -10,6 +10,9 @@ python-dotenv>=1.0.0
 # Optional: Encoding detection (for JSON parser to handle multiple encodings)
 chardet>=5.0.0
 
+# JSON Schema Validation (optional, for advanced schema validation)
+jsonschema>=4.17.0
+
 # Build Tools (for creating executable)
 pyinstaller>=5.13.0
 

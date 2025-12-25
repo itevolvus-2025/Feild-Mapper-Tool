@@ -1,19 +1,38 @@
-# Field Mapper - Document to JSON Comparison Tool
+# Field Mapper - Annexure to JSON Comparison Tool
 
-A desktop application built with Python that compares field names from database tables (extracted from Word documents) with fields in JSON files. This tool helps identify matching and mismatched fields between your database schema documentation and JSON data structures.
+A desktop application built with Python that compares field names from database annexures with fields in JSON files. This tool helps identify matching and mismatched fields between your database schema documentation and JSON data structures.
 
 ## Features
 
-- **Document Parsing**: Extract database and table field information from Word (.docx) documents
-- **JSON Field Extraction**: Automatically extract field names from JSON files, including nested structures
+- **Annexure Support**: Pre-configured support for 11 database annexures including Theme Database, Biomarker Module, Clinical Trials, and more
+- **JSON Field Extraction**: 
+  - Automatically extract field names from JSON files, including deeply nested structures
+  - Support for nested arrays with intelligent field path resolution
+  - Recursive folder scanning (finds JSON files in all subfolders)
+  - Handles both direct JSON files and multi-level folder structures
 - **Intelligent Matching**: 
-  - Exact field name matching
+  - Exact field name matching with normalization
   - Fuzzy matching for similar field names (configurable similarity threshold)
-  - Case-insensitive comparison option
+  - Case-insensitive comparison
+  - Smart array field matching (matches fields both with and without array prefixes)
+- **Advanced Features**:
+  - **JSON Validation**: Comprehensive validation for syntax errors, structure issues, and data quality
+  - Batch processing of multiple JSON files
+  - Per-file detailed field-level logging
+  - Special character detection and validation
+  - Null/empty category detection
+  - Multi-record JSON file support
+  - Memory-optimized processing for large datasets
+- **Comprehensive Logging**:
+  - Detailed per-file field analysis showing exactly which fields are missing in each JSON file
+  - Per-file summary statistics
+  - Unique fields summary across all files
+  - Special characters log
+  - Error log with detailed information
 - **Visual Comparison**: 
   - Color-coded results (green for matches, red/yellow for mismatches)
   - Detailed summary statistics
-  - Export results to JSON or text files
+  - Export results to multiple formats
 - **User-Friendly GUI**: Built with tkinter for easy desktop use
 
 ## Installation
@@ -34,38 +53,70 @@ A desktop application built with Python that compares field names from database 
 
 ## Usage
 
-### Loading Database Fields from Document
+### Step 1: Select Annexure
 
-1. Click **"Browse"** to select your Word document (.docx file)
-2. Click **"Parse Document"** to extract database and table information
-3. Select a **Database** from the dropdown (automatically populated after parsing)
-4. Select a **Table** from the dropdown (automatically populated based on selected database)
-5. Click **"Load Fields from Document"** to load field names for the selected table
+1. Select an **Annexure** from the dropdown (e.g., "Theme Database", "Biomarker Genomic/Molecular Alteration Module")
+2. Click **"Load Annexure Fields"** to load the predefined field schema
+3. The tool will display the number of fields loaded and their status
 
-### Loading JSON Fields
+### Step 2: Select JSON Folder
 
-1. Click **"Browse"** to select a JSON file
-2. (Optional) Enter a **JSON Path** if you want to extract fields from a specific section:
-   - Example: `data.fields` to extract from `{"data": {"fields": {...}}}`
-   - Example: `root.items` to extract from nested structure
-3. Click **"Load JSON Fields"** to extract field names
+1. Click **"Browse Folder"** in the JSON Folder Configuration section
+2. Select a folder containing your JSON files
+   - The tool will **recursively scan all subfolders** and find all JSON files
+   - Works with any folder structure (direct files, nested subfolders, or mixed)
+3. You'll see a confirmation showing how many JSON files were found (e.g., "15 in root, 45 in subfolders")
 
-### Comparing Fields
+### Step 3: Validate JSON (Optional but Recommended)
 
-1. After loading both database fields and JSON fields, click **"Compare Fields"**
-2. View results in the **Comparison Results** tab:
+1. Click **"Validate JSON"** to check all JSON files for errors
+2. Review validation results:
+   - Syntax errors and their locations
+   - Structure issues and warnings
+   - Data quality problems
+3. Fix any invalid files before proceeding
+4. See [JSON_VALIDATOR_GUIDE.md](JSON_VALIDATOR_GUIDE.md) for detailed validation documentation
+
+### Step 4: Compare Fields
+
+1. Click **"Compare Fields"** to start the comparison
+2. The tool will process all JSON files and compare them against the selected annexure
+3. View real-time progress in the Processing Status section
+4. Results appear in the **Comparison Results** tab:
    - **Matched fields**: Green background
-   - **Unmatched DB fields**: Red background (fields in database but not in JSON)
-   - **Unmatched JSON fields**: Yellow background (fields in JSON but not in database)
-3. Check the **Summary** tab for detailed statistics
+   - **Fields missing in JSON**: Red background (fields in annexure but not in JSON)
+   - **Fields not in annexure**: Yellow background (fields in JSON but not in annexure)
+5. Check the **Summary** tab for detailed statistics
 
-### Exporting Results
+### Step 5: View Additional Results
 
-Click **"Export Results"** to save comparison results to a JSON or text file.
+Use the action buttons at the bottom:
+
+- **Validate JSON**: Check JSON files for syntax and structure errors
+- **Show Unmatched Fields**: Filter to show only mismatched fields
+- **Export Results**: Save comparison results to a file
+- **Export Fields Not Found Under Annexure**: Export only JSON fields not in annexure
+- **Show Special Characters**: View fields containing special characters
+- **View Logs**: Open detailed log files showing per-file field analysis
+- **Clear All**: Reset the tool for a new comparison
+
+### Understanding the Logs
+
+The field matching log (in the `logs/` folder) contains three sections:
+
+1. **DETAILED PER-FILE FIELD ANALYSIS** (beginning of log):
+   - Shows **exactly which fields** are missing for **each specific JSON file**
+   - Search for your filename (Ctrl+F) to find its details
+   
+2. **PER-FILE SUMMARY STATISTICS** (middle of log):
+   - Shows counts only (e.g., "Matched: 13, Missing in JSON: 16")
+   
+3. **UNIQUE UNMATCHED FIELDS** (end of log):
+   - Lists all unique fields with issues across all files combined
 
 ## JSON File Structure Support
 
-The tool supports various JSON structures:
+The tool supports various JSON structures and automatically handles complex nesting:
 
 ### Simple Object
 ```json
@@ -97,65 +148,123 @@ The tool supports various JSON structures:
 }
 ```
 
-Use the **JSON Path** field to navigate to specific sections:
-- For nested objects: `data.user`
-- For arrays: The tool automatically extracts fields from the first array element
+### Nested Arrays (Advanced)
+```json
+{
+  "BIOPATHWAY_PRODUCT_DETAILS": [
+    {
+      "BIOPATHWAYPRODUCT:ENZYME": "CYP2C19",
+      "BIOPATHWAYPRODUCT:REACTION_TYPE": "Hydroxylation"
+    }
+  ]
+}
+```
+
+**Smart Array Field Matching**: The tool extracts fields from nested arrays in two ways:
+- With full path: `BIOPATHWAY_PRODUCT_DETAILS.BIOPATHWAYPRODUCT:ENZYME`
+- Without prefix: `BIOPATHWAYPRODUCT:ENZYME`
+
+This allows fields inside arrays to match against your annexure configuration regardless of whether the array parent name is included.
 
 ## Configuration
 
-You can modify comparison behavior by editing `field_comparator.py`:
+### Annexure Configuration (`database_config.py`)
+
+Add or modify annexure schemas:
+
+```python
+DATABASE_FIELDS = {
+    "Your Annexure Name": [
+        "FIELD_1",
+        "FIELD_2",
+        "NESTED_FIELD",
+        # ... more fields
+    ]
+}
+```
+
+### Comparison Settings (`field_comparator.py`)
 
 - `case_sensitive`: Set to `True` for case-sensitive matching
 - `fuzzy_match`: Set to `False` to disable fuzzy matching
 - `similarity_threshold`: Adjust threshold (0.0 to 1.0) for fuzzy matching
 
-## Document Format
+### Special Character Configuration
 
-The tool expects Word documents (.docx) containing database and table field information. The parser looks for:
+Configure which fields should have special characters removed during processing in `database_config.py`:
 
-- **Database names**: Patterns like "Database: name", "DB: name", or "Database Name: name"
-- **Table names**: Patterns like "Table: name", "Table Name: name", or "Fields for: name"
-- **Field names**: Lists of field names, either in:
-  - Comma-separated lists
-  - Bullet points
-  - Table format (with a "Field" or "Column" header)
-
-### Example Document Structure
-
+```python
+SPECIAL_CHAR_REMOVAL = {
+    "Theme Database": {
+        "FIELD_NAME": ['®', '™'],  # Characters to remove from this field
+    }
+}
 ```
-Database: MyDatabase
 
-Table: Users
-Fields: id, name, email, created_at, updated_at
+## Supported Annexures
 
-Table: Orders
-Fields: order_id, user_id, product_name, quantity, price, order_date
-```
+The tool comes pre-configured with 11 annexures:
+
+1. **Theme Database** - Biotransformation pathways and drug metabolism
+2. **Biomarker Genomic/Molecular Alteration Module**
+3. **Investigational and Approved Therapeutics Module**
+4. **Clinical Trials Module**
+5. **Protein Degradation Database (Proximers Database)**
+6. **Spectra Database**
+7. **Cellular Assay Database**
+8. **Toxicology Database**
+9. **ADME Properties Module**
+10. **Liceptor Database**
+11. **Investigational and Approved Therapeutic Drug Targets Module**
 
 ## Troubleshooting
 
-### Document Parsing Issues
+### Common Issues
 
-- **No databases found**: Ensure your document contains clear database and table names
-- **No fields found**: Check that field names are listed clearly after table names
-- **Format issues**: The parser looks for common patterns. If your document uses a different format, you may need to adjust the document structure or modify `document_parser.py`
+**Q: Why are fields showing as "not found under annexure" when they exist in my JSON?**
 
-### JSON Parsing Issues
+A: This usually happens with nested array fields. The latest version includes smart array field matching that extracts fields both with and without array prefixes. Make sure you're using the updated version.
 
-- Ensure JSON file is valid (use a JSON validator)
-- For nested structures, use the JSON Path field to navigate
-- Large JSON files may take time to process
+**Q: How do I know which specific fields are missing in each JSON file?**
+
+A: Open the field matching log file in the `logs/` folder. The beginning of the log contains a "DETAILED PER-FILE FIELD ANALYSIS" section showing exactly which fields are missing for each file. Use Ctrl+F to search for your filename.
+
+**Q: The tool says "No JSON files found" but I have JSON files in my folder**
+
+A: Check that:
+- Files have a `.json` extension
+- You've selected the correct folder
+- The tool now recursively scans subfolders, so it should find files anywhere in the folder tree
+
+**Q: Fields with special characters (®, ™, etc.) are causing issues**
+
+A: Configure special character removal in `database_config.py`. The tool can automatically clean specific characters from specified fields during comparison.
+
+### Performance Tips
+
+- For folders with 100+ JSON files, the tool will prompt for confirmation before processing
+- Large files are processed in batches to optimize memory usage
+- Progress is shown in real-time during processing
 
 ## File Structure
 
 ```
 .
 ├── field_mapper.py          # Main application GUI
-├── document_parser.py      # Word document parsing and field extraction
-├── json_parser.py          # JSON file parsing and field extraction
-├── field_comparator.py     # Field comparison logic
-├── requirements.txt        # Python dependencies
-└── README.md              # This file
+├── database_config.py       # Annexure configurations and field definitions
+├── json_parser.py           # JSON file parsing and field extraction
+├── json_validator.py        # JSON validation module (NEW)
+├── field_comparator.py      # Field comparison logic
+├── field_loader.py          # Field loading utilities
+├── document_parser.py       # Word document parsing (legacy support)
+├── requirements.txt         # Python dependencies
+├── logs/                    # Generated log files
+│   ├── *_field_matching_*.log     # Detailed field matching results
+│   ├── *_special_chars_*.log      # Special character validation
+│   ├── *_errors_*.log             # Error logs
+│   └── json_validation_*.log      # JSON validation reports (NEW)
+├── README.md                # This file
+└── JSON_VALIDATOR_GUIDE.md  # JSON validator documentation (NEW)
 ```
 
 ## License
@@ -169,12 +278,32 @@ For issues or questions, please check:
 2. JSON file format validity
 3. Required Python packages are installed (python-docx)
 
+## Recent Enhancements
+
+### December 2024
+- ✅ **JSON Validator**: Comprehensive validation for syntax errors, structure issues, and data quality
+  - Syntax validation with error location and suggestions
+  - Structure validation (nesting depth, consistency checks)
+  - Data quality checks (null values, empty strings, file size)
+  - Batch validation with detailed reports
+  - Optional JSON schema validation support
+  - See [JSON_VALIDATOR_GUIDE.md](JSON_VALIDATOR_GUIDE.md) for details
+
+### November 2024
+- ✅ **Removed JSON Path Input**: Simplified UI by removing the optional JSON path field
+- ✅ **Recursive Folder Scanning**: Automatically finds JSON files in all subfolders
+- ✅ **Smart Array Field Matching**: Extracts nested array fields with and without parent prefixes
+- ✅ **Detailed Per-File Logging**: Shows exactly which fields are missing in each JSON file
+- ✅ **Enhanced Log Structure**: Three-section logs (detailed analysis, statistics, unique summary)
+- ✅ **Improved Field Extraction**: Better handling of deeply nested structures
+- ✅ **Memory Optimization**: Batch processing for large file sets
+
 ## Future Enhancements
 
-- Support for multiple tables comparison
-- Batch JSON file processing
-- Field type comparison
-- Mapping configuration save/load
-- Command-line interface option
-- Report generation (PDF/Excel)
+- Field type comparison and validation
+- Export to Excel format
+- Command-line interface for automation
+- Custom annexure import/export
+- Field mapping suggestions using AI
+- Multi-annexure comparison mode
 
