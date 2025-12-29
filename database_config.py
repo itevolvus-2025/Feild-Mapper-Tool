@@ -22,6 +22,13 @@ EXCLUDED_KEYWORDS = {
     # "Database Name": ['keyword1', 'keyword2', ...]
 }
 
+# Global string removal configuration
+# Strings in this list will be removed from ALL field values in ALL databases
+# Format: [list of strings to remove from all field values]
+GLOBAL_STRING_REMOVAL = [
+    '-ISIS-',  # Remove '-ISIS-' from all field values
+]
+
 # Database-specific special character removal configuration
 # Format: {database_name: {field_name: [list of special characters to remove]}}
 # Example: Remove '@' and '#' from 'email' field in 'User Database'

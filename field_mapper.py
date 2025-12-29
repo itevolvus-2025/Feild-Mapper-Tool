@@ -1176,10 +1176,10 @@ Report saved to: {report_path}
                             if json_data and database:
                                 cleaned_data, chars_removed = self.json_parser.clean_special_characters(json_data, database)
                                 if chars_removed > 0:
-                                    # Save cleaned JSON to cleaned_json folder
-                                    cleaned_path = self.json_parser.save_cleaned_json(json_file, cleaned_data)
+                                    # Save cleaned JSON (overwrite original file)
+                                    cleaned_path = self.json_parser.save_cleaned_json(json_file, cleaned_data, overwrite_original=True)
                                     if cleaned_path:
-                                        logger.info(f"Removed {chars_removed} special character(s) from {os.path.basename(json_file)}. Cleaned file saved to: {cleaned_path}")
+                                        logger.info(f"Removed {chars_removed} character(s) from {os.path.basename(json_file)}. File saved (overwritten): {cleaned_path}")
                                     # Use cleaned data for comparison
                                     json_data = cleaned_data
                             
@@ -1574,10 +1574,10 @@ Report saved to: {report_path}
                             if json_data and database:
                                 cleaned_data, chars_removed = self.json_parser.clean_special_characters(json_data, database)
                                 if chars_removed > 0:
-                                    # Save cleaned JSON to cleaned_json folder
-                                    cleaned_path = self.json_parser.save_cleaned_json(json_file, cleaned_data)
+                                    # Save cleaned JSON (overwrite original file)
+                                    cleaned_path = self.json_parser.save_cleaned_json(json_file, cleaned_data, overwrite_original=True)
                                     if cleaned_path:
-                                        logger.info(f"Removed {chars_removed} special character(s) from {os.path.basename(json_file)}. Cleaned file saved to: {cleaned_path}")
+                                        logger.info(f"Removed {chars_removed} character(s) from {os.path.basename(json_file)}. File saved (overwritten): {cleaned_path}")
                                     # Use cleaned data for comparison
                                     json_data = cleaned_data
                             

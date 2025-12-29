@@ -669,7 +669,8 @@ class JSONParser:
     
     def clean_special_characters(self, data: Any, database_name: str, field_path: str = "") -> Tuple[Any, int]:
         """
-        Remove specific special characters from specific fields based on database configuration
+        Remove specific special characters and strings from field values based on database configuration
+        Supports both global string removal (applies to all fields) and field-specific character removal
         
         Args:
             data: JSON data (dict, list, or nested structure)
@@ -681,15 +682,12 @@ class JSONParser:
         """
         try:
             import database_config
+            
+            # Get global string removal configuration (applies to all fields)
+            global_strings_to_remove = getattr(database_config, 'GLOBAL_STRING_REMOVAL', [])
+            
+            # Get database-specific character removal configuration
             removal_config = getattr(database_config, 'SPECIAL_CHAR_REMOVAL', {})
-            
-            # If no configuration for this database, return data unchanged
-            if database_name not in removal_config:
-                return data, 0
-            
-            field_config = removal_config[database_name]
-            if not field_config:
-                return data, 0
             
             total_removed = 0
             
@@ -697,40 +695,54 @@ class JSONParser:
             def normalize_name(name: str) -> str:
                 return name.lower().replace(' ', '').replace('_', '').replace('-', '').replace('.', '').replace(':', '')
             
-            # Create normalized lookup dictionary
+            # Create normalized lookup dictionary for field-specific removal
             normalized_config = {}
-            for field_name, chars_to_remove in field_config.items():
-                normalized_name = normalize_name(field_name)
-                normalized_config[normalized_name] = chars_to_remove
+            field_config = removal_config.get(database_name, {})
+            if field_config:
+                for field_name, chars_to_remove in field_config.items():
+                    normalized_name = normalize_name(field_name)
+                    normalized_config[normalized_name] = chars_to_remove
+            
+            def clean_string_value(value: str, current_path: str) -> Tuple[str, int]:
+                """Clean a string value by removing global strings and field-specific characters"""
+                original_value = value
+                removed_count = 0
+                
+                # First, remove global strings (applies to all fields)
+                for string_to_remove in global_strings_to_remove:
+                    if string_to_remove in value:
+                        occurrences = value.count(string_to_remove)
+                        value = value.replace(string_to_remove, '')
+                        removed_count += len(string_to_remove) * occurrences
+                        if occurrences > 0:
+                            logger.debug(f"Removed '{string_to_remove}' ({occurrences} occurrence(s)) from field '{current_path}' in {database_name}")
+                
+                # Then, remove field-specific characters (if this field is configured)
+                normalized_key = normalize_name(current_path.split('.')[-1] if '.' in current_path else current_path)
+                if normalized_key in normalized_config:
+                    chars_to_remove = normalized_config[normalized_key]
+                    for char in chars_to_remove:
+                        if char in value:
+                            occurrences = value.count(char)
+                            value = value.replace(char, '')
+                            removed_count += occurrences
+                            if occurrences > 0:
+                                logger.debug(f"Removed '{char}' ({occurrences} occurrence(s)) from field '{current_path}' in {database_name}")
+                
+                return value, removed_count
             
             if isinstance(data, dict):
                 cleaned_data = {}
                 for key, value in data.items():
-                    # Check if this field should have characters removed
-                    normalized_key = normalize_name(key)
                     current_path = f"{field_path}.{key}" if field_path else key
                     
-                    if normalized_key in normalized_config:
-                        chars_to_remove = normalized_config[normalized_key]
-                        if isinstance(value, str):
-                            # Remove specified characters from string value
-                            original_value = value
-                            for char in chars_to_remove:
-                                value = value.replace(char, '')
-                            removed_count = len(original_value) - len(value)
-                            total_removed += removed_count
-                            if removed_count > 0:
-                                logger.debug(f"Removed {removed_count} special character(s) from field '{current_path}' in {database_name}")
-                            cleaned_data[key] = value
-                        elif isinstance(value, (dict, list)):
-                            # Recursively clean nested structures
-                            cleaned_value, removed = self.clean_special_characters(value, database_name, current_path)
-                            cleaned_data[key] = cleaned_value
-                            total_removed += removed
-                        else:
-                            cleaned_data[key] = value
+                    if isinstance(value, str):
+                        # Clean string value
+                        cleaned_value, removed = clean_string_value(value, current_path)
+                        cleaned_data[key] = cleaned_value
+                        total_removed += removed
                     elif isinstance(value, (dict, list)):
-                        # Recursively process nested structures even if field name doesn't match
+                        # Recursively clean nested structures
                         cleaned_value, removed = self.clean_special_characters(value, database_name, current_path)
                         cleaned_data[key] = cleaned_value
                         total_removed += removed
@@ -743,7 +755,12 @@ class JSONParser:
                 cleaned_list = []
                 for idx, item in enumerate(data):
                     current_path = f"{field_path}[{idx}]" if field_path else f"[{idx}]"
-                    if isinstance(item, (dict, list)):
+                    if isinstance(item, str):
+                        # Clean string value in list
+                        cleaned_item, removed = clean_string_value(item, current_path)
+                        cleaned_list.append(cleaned_item)
+                        total_removed += removed
+                    elif isinstance(item, (dict, list)):
                         cleaned_item, removed = self.clean_special_characters(item, database_name, current_path)
                         cleaned_list.append(cleaned_item)
                         total_removed += removed
@@ -753,13 +770,14 @@ class JSONParser:
                 return cleaned_list, total_removed
             
             else:
+                # For primitive types (int, float, bool, None), return as-is
                 return data, 0
                 
         except Exception as e:
             logger.error(f"Error cleaning special characters: {str(e)}", exc_info=True)
             return data, 0
     
-    def save_cleaned_json(self, original_file_path: str, cleaned_data: Any, output_dir: str = None) -> Optional[str]:
+    def save_cleaned_json(self, original_file_path: str, cleaned_data: Any, output_dir: str = None, overwrite_original: bool = False) -> Optional[str]:
         """
         Save cleaned JSON data to a file
         
@@ -767,28 +785,37 @@ class JSONParser:
             original_file_path: Path to original JSON file
             cleaned_data: Cleaned JSON data
             output_dir: Directory to save cleaned file (default: 'cleaned_json' folder next to original)
+                        Ignored if overwrite_original is True
+            overwrite_original: If True, overwrite the original file. If False, save to output_dir
         
         Returns:
             Path to saved cleaned file, or None if failed
         """
         try:
-            if output_dir is None:
-                # Create 'cleaned_json' folder in the same directory as the original file
-                original_dir = os.path.dirname(os.path.abspath(original_file_path))
-                output_dir = os.path.join(original_dir, 'cleaned_json')
-            
-            # Create output directory if it doesn't exist
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # Generate output filename (keep original name)
-            original_filename = os.path.basename(original_file_path)
-            output_path = os.path.join(output_dir, original_filename)
+            if overwrite_original:
+                # Overwrite the original file
+                output_path = original_file_path
+            else:
+                if output_dir is None:
+                    # Create 'cleaned_json' folder in the same directory as the original file
+                    original_dir = os.path.dirname(os.path.abspath(original_file_path))
+                    output_dir = os.path.join(original_dir, 'cleaned_json')
+                
+                # Create output directory if it doesn't exist
+                os.makedirs(output_dir, exist_ok=True)
+                
+                # Generate output filename (keep original name)
+                original_filename = os.path.basename(original_file_path)
+                output_path = os.path.join(output_dir, original_filename)
             
             # Write cleaned JSON with proper indentation
             with open(output_path, 'w', encoding='utf-8') as f:
                 json.dump(cleaned_data, f, indent=2, ensure_ascii=False)
             
-            logger.info(f"Saved cleaned JSON to: {output_path}")
+            if overwrite_original:
+                logger.info(f"Saved cleaned JSON (overwritten original): {output_path}")
+            else:
+                logger.info(f"Saved cleaned JSON to: {output_path}")
             return output_path
             
         except Exception as e:
